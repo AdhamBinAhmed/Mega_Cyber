@@ -1,0 +1,559 @@
+===============================================================================
+MEGA DEVS PASSIVE SCANNER — ROADMAP FOR ADVANCED SECURITY CHECKS
+Written 2026-11-05 · against scanner v1.0.0 / report schema 1.0
+===============================================================================
+
+PURPOSE
+  The MVP ships five checks (headers, TLS, DNS, exposed files, fingerprint).
+  This plan covers what to add next, in what order, and — more importantly —
+  where the line is that this product must not cross.
+
+HOW TO READ IT
+  Every candidate check is tagged:
+
+    [P0]  passive, no new request. Extracted from data we already hold.
+    [P1]  passive, costs extra GETs to the target. Same class as the
+          existing exposed-files sweep.
+    [P2]  passive, zero traffic to the target. Third-party or DNS sources.
+    [A]   ACTIVE. Out of scope for the free embedded service. See section 6.
+
+  Effort is S / M / L. Value is the honest client-facing impact, not novelty.
+
+-------------------------------------------------------------------------------
+0. THE GOVERNING CONSTRAINT
+-------------------------------------------------------------------------------
+
+  The product promise is "100% passive". That is a legal and commercial
+  position, not a technical preference, and it is the reason this can be a
+  free button on a public marketing site with only a consent checkbox.
+
+  Three rules follow. They are not negotiable without changing the product:
+
+  1. No request that a browser or a search crawler would not plausibly make.
+  2. No request intended to change state, authenticate, or cause load.
+  3. Nothing is done with what is found. A readable /.env is reported as a
+     status code and a signature match. It is never read in full, never
+     stored, never re-fetched.
+
+  Anything in section 6 breaks these rules. Those checks are genuinely more
+  powerful, and they belong in a separate, contracted engagement with signed
+  scope — not behind a checkbox on a landing page. Mixing them would put the
+  free service's legal footing at risk.
+
+  REQUEST BUDGET. One scan currently makes ~21 requests to the target
+  (1 page + 1 HTTP redirect probe + 13 exposure + 1 TLS + 4 protocol + 1).
+  Several items below add paths. Before adding ANY of them, land item 5.2
+  (central request budget). Thirty more paths per scan, multiplied by an
+  embedded public form, turns this tool into a nuisance and gets our egress
+  IPs blocked.
+
+-------------------------------------------------------------------------------
+1. TIER P0 — FREE WINS FROM DATA WE ALREADY HAVE
+-------------------------------------------------------------------------------
+
+  These parse the document and headers already in memory from the single page
+  fetch in src/lib/scan.ts. No new traffic, no new latency. Do these first:
+  highest value per unit of risk in the whole plan.
+
+  1.1  SECRET AND CREDENTIAL LEAKAGE IN HTML / INLINE JS      [P0] L  CRITICAL
+       Scan the document and inline <script> bodies for credential shapes:
+       AWS access key IDs (AKIA/ASIA + 16), AWS secret keys, Google API keys
+       (AIza + 35), Firebase config blocks, Stripe live keys (sk_live/rk_live),
+       Slack tokens (xox[baprs]-), GitHub tokens (gh[pousr]_), private key
+       PEM headers, JWTs with decodable payloads, Mailgun/Twilio/SendGrid
+       keys, and generic `KEY|SECRET|TOKEN|PASSWORD = "..."` assignments.
+
+       Accuracy is everything here. Requirements:
+         - Shannon entropy threshold on the candidate, not regex alone.
+         - Allowlist of known-public values: Stripe pk_live_ publishable keys,
+           Google Maps browser keys, Firebase apiKey (public by design),
+           reCAPTCHA site keys, Sentry public DSNs. Flagging these as leaks
+           is the fastest way to lose a client's trust — a browser key is
+           *supposed* to be in the page.
+         - Distinguish "secret that must never ship" (AWS secret, Stripe
+           sk_live, private key) = critical, from "public-by-design key with
+           no referrer restriction" = low/info.
+       MUST land with item 5.3 (evidence redaction) in the same change.
+       Reports get downloaded and emailed; we must never be the thing that
+       distributes the secret more widely.
+
+  1.2  SUBRESOURCE INTEGRITY (SRI)                            [P0] S  HIGH
+       Third-party <script src> and <link rel=stylesheet> from a cross-origin
+       host without an `integrity` attribute. Each one is an unmitigated
+       supply-chain dependency: whoever controls that CDN controls your page.
+       Report per-origin, not per-tag. Note `crossorigin` requirement.
+
+  1.3  MIXED CONTENT                                          [P0] S  HIGH
+       http:// subresources referenced from an https:// document. Active
+       mixed content (script/iframe) is high; passive (img/video) is medium.
+       Also flag protocol-relative (//host/x) as a legacy smell.
+
+  1.4  CROSS-ORIGIN ISOLATION HEADERS                         [P0] S  MEDIUM
+       Cross-Origin-Opener-Policy, Cross-Origin-Embedder-Policy,
+       Cross-Origin-Resource-Policy. COOP absence enables window-handle
+       attacks against OAuth popups; the trio gates Spectre-class XS-leaks.
+       Mozilla Observatory scores these now; our grade should correlate.
+       Slots straight into src/lib/checks/headers.ts next to the six.
+
+  1.5  CORS POLICY (PASSIVE + REFLECTIVE READ)                [P0] M  HIGH
+       From the response we have: `Access-Control-Allow-Origin: *` together
+       with `Access-Control-Allow-Credentials: true` is an invalid and
+       dangerous combination. Then one ordinary GET with an
+       `Origin: https://probe.invalid` header: if ACAO reflects it AND
+       credentials are allowed, any site can read authenticated responses.
+       That is a single non-mutating GET, so it stays passive — but it is the
+       one item here that adds a request, so gate it behind the budget.
+
+  1.6  COOKIE HARDENING, DEEPER                               [P0] S  MEDIUM
+       Extends the existing cookie checks: `__Host-` / `__Secure-` prefix
+       usage, `Domain` broader than the host (shares the cookie with every
+       subdomain), `SameSite=None` without `Secure` (rejected by browsers),
+       session-looking cookies with a long `Max-Age`, and duplicate names.
+
+  1.7  CSP DEEP ANALYSIS                                      [P0] L  HIGH
+       The current check is presence-and-obvious-weakness. Upgrade to:
+         - effective-policy computation when multiple CSP headers are sent
+           (browsers intersect them)
+         - `script-src` allowing `data:` (trivially bypassable)
+         - allowlisted origins known to host JSONP or AngularJS endpoints,
+           which turns an allowlist into an arbitrary-execution bypass
+         - nonce reuse across responses (fetch the page twice — budget) and
+           nonces shorter than 128 bits
+         - missing `object-src`/`base-uri` when no `default-src` fallback
+         - `frame-ancestors` vs X-Frame-Options conflict
+         - report a plain-language "this policy stops / does not stop XSS"
+           verdict, which is what the client actually wants to know
+
+  1.8  REVERSE TABNABBING                                     [P0] S  LOW
+       `target="_blank"` on external links without `rel="noopener"`. Modern
+       browsers imply noopener, so this is low — report as hygiene, and only
+       on links to third-party origins.
+
+  1.9  FORM SECURITY                                          [P0] M  HIGH
+       Any form whose `action` is http:// on an https:// page. Password
+       inputs on a page served over HTTP. Login/payment forms posting
+       cross-origin. Absence of any hidden token field on a state-changing
+       POST form (heuristic, report as info — we cannot see server-side
+       CSRF validation, and saying otherwise would be dishonest).
+
+  1.10 CACHEABILITY OF AUTHENTICATED RESPONSES                [P0] S  MEDIUM
+       A response carrying `Set-Cookie` that is also publicly cacheable
+       (`Cache-Control: public`, or no no-store on a personalised page) can
+       be served to the wrong user by a shared cache or CDN.
+
+  1.11 INTERNAL DETAIL IN HTML COMMENTS                       [P0] M  MEDIUM
+       HTML comments and inline JS containing internal hostnames, RFC1918
+       addresses, staging/UAT URLs, stack traces, absolute filesystem paths,
+       database names, or TODO/FIXME text mentioning auth or passwords.
+       Entropy/keyword scored; cap the number reported.
+
+  1.12 SOURCE MAP REFERENCES                                  [P0] S  MEDIUM
+       `//# sourceMappingURL=` in served JS means original source may be
+       reachable. Detection is P0 (it is in the bundle we already have);
+       confirming the .map actually resolves is P1 (one GET per unique map,
+       capped at ~3).
+
+  1.13 THIRD-PARTY SCRIPT INVENTORY                           [P0] M  MEDIUM
+       Count and list distinct third-party origins serving script. Every one
+       is a company that can change your page. Flag abandoned/high-risk CDNs
+       and any origin that is itself a known breach vector. Pairs with 1.2.
+       Also a strong commercial hook: clients rarely know this number.
+
+-------------------------------------------------------------------------------
+2. TIER P1 — MORE WELL-KNOWN PATHS (COSTS REQUESTS)
+-------------------------------------------------------------------------------
+
+  All of these extend src/lib/data/exposure-paths.ts, which is already a
+  data-driven catalogue with per-path content signatures. Adding entries is
+  cheap in code and expensive in requests — so these ship behind the budget
+  and in priority order, not all at once.
+
+  2.1  EXPANDED SENSITIVE-PATH CATALOGUE                      [P1] M  CRITICAL
+       Grouped by what they leak. Each needs a content signature, or it will
+       false-positive on SPA catch-alls (see src/lib/checks/exposure.ts):
+
+       Credentials / config:
+         /.env.local  /.env.production  /.env.backup  /config.json
+         /appsettings.json  /web.config  /.npmrc  /.netrc
+         /docker-compose.yml  /Dockerfile  /.aws/credentials
+         /.vscode/sftp.json  /.idea/workspace.xml
+       Source / VCS:
+         /.git/index  /.git/logs/HEAD  /.hg/store  /.bzr/
+         /composer.lock  /package.json  /yarn.lock  /Gemfile.lock
+       CI/CD:
+         /.gitlab-ci.yml  /.travis.yml  /Jenkinsfile  /.github/workflows/
+       Database / backup:
+         /backup.sql  /dump.sql  /db.sqlite  /database.sqlite  /*.bak
+       Framework debug surfaces (very high value):
+         /actuator/env  /actuator/health  /actuator/heapdump   (Spring)
+         /_profiler  /app_dev.php                              (Symfony)
+         /telescope  /horizon                                  (Laravel)
+         /debug/default/view                                   (Yii)
+         /__debug__/                                           (Django)
+         /_next/static/chunks/  (sanity only)                  (Next)
+       API surface:
+         /swagger.json  /openapi.json  /api-docs  /graphql
+         /.well-known/openid-configuration  /metrics  (Prometheus)
+       Legacy policy files:
+         /crossdomain.xml  /clientaccesspolicy.xml  (wildcard = flag)
+
+       /actuator/heapdump deserves special mention: if reachable it is a
+       full memory dump containing live credentials and session tokens.
+       Critical, and we report its presence only — we never download it.
+       Enforce that with a HEAD-or-ranged-GET and a hard byte cap.
+
+  2.2  DEPENDENCY MANIFESTS FEED THE CVE MATCHER              [P1] M  HIGH
+       If /package.json, /composer.lock or /yarn.lock is readable it is both
+       a finding (2.1) and a gift: exact dependency versions, far better
+       than guessing from script URLs. Pipe them into matchVulnerabilities()
+       in src/lib/checks/fingerprint.ts. Cap parse size; ignore if > 256 KB.
+
+  2.3  USER ENUMERATION ENDPOINTS                             [P1] S  MEDIUM
+       /wp-json/wp/v2/users and /?author=1 leak the author list and valid
+       usernames, which is the first half of a credential-stuffing run.
+       Report presence; do not enumerate past the first response.
+
+  2.4  ADMIN SURFACE REACHABILITY                             [P1] M  MEDIUM
+       /wp-login.php /administrator /admin /user/login /login.
+       Report only that the panel answers from the public internet, which is
+       a real finding (it should be IP-restricted or behind SSO). NEVER
+       submit a credential, not even a deliberately wrong one — that is an
+       authentication attempt and crosses into section 6.
+
+  2.5  GRAPHQL INTROSPECTION                                  [P1] M  HIGH
+       If /graphql exists, one introspection query reveals the entire schema,
+       including mutations and internal field names. Judgement call: it is a
+       read-only query, so it is passive in substance — but it is a POST, and
+       a POST to an unknown endpoint deserves care. Decision: ship it, send
+       only the canonical `{__schema{queryType{name}}}` probe, never a
+       mutation, and document it in the scope statement on the landing page.
+
+  2.6  HTTP METHODS VIA OPTIONS                               [P1] S  LOW
+       One OPTIONS request; read `Allow` / `Access-Control-Allow-Methods`.
+       Flags TRACE (cross-site tracing) and PUT/DELETE exposure. Non-mutating
+       by definition. Low value in practice — modern stacks rarely misreport
+       here — so low priority despite being easy.
+
+  2.7  SOURCE MAP CONFIRMATION                                [P1] S  MEDIUM
+       Follow up on 1.12 for up to 3 unique .map URLs. 200 + valid JSON with
+       a `sources` array = original source code is public. Read the header of
+       the file only; do not pull the whole map.
+
+-------------------------------------------------------------------------------
+3. TIER P2 — ZERO TRAFFIC TO THE TARGET
+-------------------------------------------------------------------------------
+
+  The most underrated category. These send nothing to the client's site at
+  all, so they carry no load, no log noise, and no authorization question —
+  while producing some of the highest-severity findings available.
+
+  3.1  SUBDOMAIN TAKEOVER DETECTION                           [P2] L  CRITICAL
+       The single highest-value addition in this plan.
+       Enumerate subdomains from Certificate Transparency logs (crt.sh), then
+       for each: resolve the CNAME chain and match the target against a
+       fingerprint list of unclaimed SaaS endpoints (S3, CloudFront, Azure
+       websites, GitHub Pages, Heroku, Shopify, Fastly, Netlify, Zendesk,
+       Surge, Readme, Helpjuice, …). A dangling CNAME means anyone can claim
+       that hostname and serve content from the client's domain — cookies,
+       OAuth redirects and brand all follow.
+       Confirmation requires one GET to the *dangling* host (not the client's
+       live site) to match the provider's "no such bucket/app" body. That is
+       a request to the SaaS provider, not to the client. Document it.
+       Needs: a maintained fingerprint table in src/lib/data/takeover.ts.
+
+  3.2  CERTIFICATE TRANSPARENCY SUBDOMAIN INVENTORY           [P2] M  HIGH
+       crt.sh gives the full history of certificates issued for the domain.
+       Routinely exposes staging, admin, vpn, jenkins, grafana and internal
+       hosts the client forgot were public. Pure third-party query.
+       Report as an inventory plus "these names look non-production".
+       Cache aggressively; crt.sh is slow and free.
+
+  3.3  DNSSEC                                                 [P2] M  MEDIUM
+       DS record at the parent, DNSKEY at the zone, and whether a validating
+       resolver returns AD. Without DNSSEC, cache-poisoning answers for the
+       domain cannot be detected by resolvers.
+
+  3.4  MTA-STS AND TLS-RPT                                    [P2] S  MEDIUM
+       `_mta-sts.<domain>` TXT plus the policy at
+       https://mta-sts.<domain>/.well-known/mta-sts.txt, and
+       `_smtp._tls.<domain>` TXT. Without MTA-STS, mail to the domain can be
+       downgraded to cleartext by an active network attacker. Natural
+       extension of the existing DNS section.
+
+  3.5  SPF RECORD QUALITY (RECURSIVE)                         [P2] M  HIGH
+       The current check reads the apex record and its `all` qualifier.
+       Upgrade: recursively resolve `include:`/`redirect=`/`a`/`mx` and count
+       DNS lookups against the RFC 7208 limit of 10. Exceeding it is a
+       *permerror*, which means SPF silently stops working entirely — a very
+       common and completely invisible failure. Also flag the `ptr`
+       mechanism (deprecated) and `include` of a domain that no longer
+       resolves.
+
+  3.6  DMARC ALIGNMENT DEPTH                                  [P2] S  MEDIUM
+       Beyond `p=`: `sp=` (subdomain policy — often forgotten, and
+       subdomains are the usual spoofing vector), `adkim`/`aspf` strict vs
+       relaxed, `pct<100` (partial enforcement reads as protected but is
+       not), and whether the `rua` destination is in a different
+       organisational domain without an authorisation record.
+
+  3.7  BIMI                                                   [P2] S  LOW
+       `default._bimi.<domain>`. Brand-trust signal, requires DMARC
+       enforcement first. Low security value; good upsell conversation.
+
+  3.8  HSTS PRELOAD LIST MEMBERSHIP                           [P2] S  LOW
+       The header can say `preload` without the domain actually being in the
+       Chromium list. Check the list; report the discrepancy.
+
+  3.9  DOMAIN REGISTRATION HEALTH (RDAP/WHOIS)                [P2] M  MEDIUM
+       Expiry date (a lapsed domain is the most total takeover there is),
+       registrar lock status (clientTransferProhibited), and nameserver
+       delegation consistency. An expiry inside 30 days is a high finding
+       that no other check in this plan would catch.
+
+  3.10 TYPOSQUAT / LOOKALIKE DOMAINS                          [P2] L  MEDIUM
+       Generate permutations (homoglyph, bitsquat, TLD swap, hyphenation),
+       resolve them, and report those that exist with an MX or a live site.
+       Brand-protection framing; strong commercial appeal. Costs a lot of DNS
+       queries, so cache and cap hard.
+
+  3.11 EXTERNAL INTELLIGENCE (API KEYS REQUIRED)              [P2] M  VARIES
+       Optional and off by default; each needs a credential, so each is a
+       deployment decision:
+         - Have I Been Pwned domain breach summary
+         - Shodan / Censys host exposure for the resolved IPs (open services
+           we are deliberately not scanning for ourselves — the data is
+           already public, so using it stays passive)
+         - GitHub code search for the domain alongside secret patterns
+           (public repos leaking the client's keys)
+         - OSV.dev / GitHub Advisory for live CVE data (see 5.4)
+       Treat these as enrichment, clearly labelled with their source, and
+       never let a third-party outage fail a scan.
+
+-------------------------------------------------------------------------------
+4. PRIORITISED ROADMAP
+-------------------------------------------------------------------------------
+
+  PHASE 1 — "no new requests" (ship first; nothing to negotiate)
+    5.1 check registry refactor        [enabler, do this first]
+    5.3 evidence redaction             [blocker for 1.1]
+    1.1 secret leakage
+    1.2 SRI
+    1.3 mixed content
+    1.4 cross-origin isolation headers
+    1.6 cookie hardening
+    1.8 reverse tabnabbing
+    1.10 cacheability
+    Outcome: materially stronger report, zero extra load on any target.
+
+  PHASE 2 — "zero traffic, high severity"
+    5.2 request budget                 [enabler]
+    3.1 subdomain takeover             [the headline feature]
+    3.2 CT subdomain inventory
+    3.5 SPF recursive quality
+    3.6 DMARC depth
+    3.9 domain registration health
+    Outcome: findings competitors' free tools do not produce, at no cost to
+    the client's infrastructure.
+
+  PHASE 3 — "deeper document analysis"
+    1.7 CSP deep analysis
+    1.9 form security
+    1.11 internal detail in comments
+    1.12 + 2.7 source maps
+    1.13 third-party inventory
+    1.5 CORS reflective read
+
+  PHASE 4 — "more paths, carefully"
+    2.1 expanded path catalogue (in severity order, a few per release)
+    2.2 dependency manifests into CVE matching
+    2.3 user enumeration
+    2.4 admin surface
+    2.5 GraphQL introspection
+    3.3 DNSSEC · 3.4 MTA-STS · 3.8 preload · 3.7 BIMI
+
+  PHASE 5 — "productise"
+    5.4 live CVE data
+    5.5 scoring recalibration + regression fixtures
+    5.6 false-positive corpus
+    3.10 typosquats · 3.11 external intel
+    PDF/branded report export, scheduled re-scans, diff-against-last-scan.
+    Diffing is the strongest retention feature here: "three things got worse
+    since October" is what turns a free scan into a retainer.
+
+-------------------------------------------------------------------------------
+5. ENGINEERING WORK THAT MUST COME WITH IT
+-------------------------------------------------------------------------------
+
+  Without these, the catalogue above becomes unmaintainable by about check
+  number twelve. 5.1 and 5.2 are prerequisites, not nice-to-haves.
+
+  5.1  CHECK REGISTRY / PLUGIN INTERFACE                      L  PREREQUISITE
+       src/lib/scan.ts currently hard-codes five calls and five section
+       keys, and ScanSections is a fixed-shape object. That does not survive
+       twenty checks. Refactor to:
+
+         interface Check {
+           id: SectionId; title: string; weight: number;
+           phase: 'document' | 'network' | 'external';
+           run(ctx: ScanContext): Promise<SectionReport<unknown>>;
+         }
+
+       with a ScanContext carrying the already-fetched document, parsed
+       headers, cookie jar, DNS answers and resolved IPs — so no check
+       re-fetches what another already has. Sections become a Record, and
+       the dashboard iterates rather than naming each one. Keep report
+       schema 1.0 compatible by bumping to 1.1 with an additive change, and
+       keep the existing section ids stable so saved reports still render.
+
+  5.2  CENTRAL REQUEST BUDGET                                 M  PREREQUISITE
+       A per-scan accounting of requests to the target, enforced in
+       src/lib/http.ts (not per-check): a hard cap (~40), a minimum interval
+       per host, and a `requestsUsed` figure in the report. Checks that run
+       out degrade to "not assessed — budget exhausted" rather than silently
+       skipping. This is what keeps "passive" from becoming "polite DoS" as
+       the path list grows, and keeps our egress IPs off blocklists.
+
+  5.3  EVIDENCE REDACTION                                     S  BLOCKER
+       Before any secret detection ships. A single redact() applied to every
+       Finding.evidence: mask all but the first and last 4 characters of
+       anything matching a credential pattern, cap evidence length, and
+       strip Authorization/Cookie values. Reports are downloaded, emailed and
+       pasted into tickets — we must not be the vector that spreads the leak
+       we just found. Unit-test that a known AWS key never appears whole in
+       serialised output.
+
+  5.4  LIVE CVE DATA                                          L  HIGH
+       src/lib/data/cves.ts is a hand-curated table with a "last reviewed"
+       date. It will rot. Replace with a build-time snapshot generated from
+       OSV.dev / GitHub Advisory for the ecosystems we fingerprint, keeping
+       the curated table as a fallback and for non-package products (Apache,
+       nginx, PHP). Emit the snapshot date in the report and warn when it is
+       older than 30 days. Keep the current "report one level below critical
+       for a version-only match" rule — it is the right call and should
+       survive the data-source change.
+
+  5.5  SCORING RECALIBRATION + REGRESSION FIXTURES            M  HIGH
+       SECTION_WEIGHTS sums to 100 across five sections. Twenty sections
+       needs a deliberate re-weighting, probably grouping checks into the
+       same five client-facing categories rather than adding sections — the
+       report must stay readable by a non-specialist. Before touching it,
+       build a fixture set: ~20 saved real reports with expected grades, so
+       any scoring change shows its blast radius. We already have two such
+       fixtures under src/components/__tests__/.
+
+  5.6  FALSE-POSITIVE CORPUS                                  M  HIGH
+       A directory of captured real-world responses with expected findings:
+       SPA catch-all 200s, Cloudflare/WAF challenge pages, login redirects,
+       geo-blocks, maintenance pages, and the public-by-design API keys from
+       1.1. Every new rule runs against it. This is the main defence of the
+       product's credibility: one confident wrong "you are leaking AWS keys"
+       costs more trust than ten missed findings.
+
+  5.7  CACHING AND DEDUPE                                     M  MEDIUM
+       Same host scanned twice inside N minutes should serve the cached
+       report. Protects the target, our budget and the free third-party APIs
+       (crt.sh especially). Needs a shared store, same as rate limiting.
+
+  5.8  JOB QUEUE FOR LONG SCANS                               L  MEDIUM
+       SSL Labs already forced a pending/poll design. CT enumeration and
+       takeover checks are slower still. The honest architecture is a queued
+       job with progressive results and optional email delivery, rather than
+       stretching a serverless invocation. Revisit once Phase 2 lands.
+
+  5.9  BROWSER SMOKE COVERAGE FOR EVERY NEW SECTION           S  ONGOING
+       scripts/smoke.mjs exists because a CSP that blocked 'unsafe-eval'
+       stopped React from hydrating: the page rendered, the API answered
+       under curl, 90 unit tests passed, and the scan button was dead. Unit
+       tests and curl cannot see that class of failure. Every new section
+       gets a smoke assertion that it renders in a real browser, run against
+       BOTH a dev and a production server, because their CSPs differ and that
+       difference is exactly what bit.
+
+-------------------------------------------------------------------------------
+6. EXPLICITLY OUT OF SCOPE — ACTIVE TESTING
+-------------------------------------------------------------------------------
+
+  These are legitimate, valuable security tests. They have no place in a free
+  scan triggered by a checkbox on a public website.
+
+    [A] Port and service scanning (nmap-class)
+    [A] Directory and file brute force (dirbuster/ffuf-class wordlists)
+    [A] Parameter and endpoint fuzzing
+    [A] Injection testing — XSS, SQLi, SSTI, command injection, XXE
+    [A] Authentication attacks — credential stuffing, password spraying,
+        MFA bypass, session fixation testing
+    [A] Open redirect and SSRF confirmation (detection of *candidate*
+        parameters from the HTML is passive and belongs in 1.x; proving
+        exploitability does not)
+    [A] Deserialization and upload-handling probes
+    [A] Subdomain brute force (CT logs give better results passively anyway)
+    [A] Load, stress or DoS testing of any kind
+
+  WHY THE LINE MATTERS
+    Each of these can cause real damage: data modification, account lockout,
+    log pollution that masks a genuine incident, downtime. A consent
+    checkbox from an anonymous visitor is not adequate authorization — the
+    person ticking it may not own the site, and often cannot grant
+    permission even if they do.
+
+  IF MEGA DEVS WANTS TO OFFER THIS
+    It is a separate product with a separate workflow:
+      - signed, scoped engagement letter naming hosts, dates and limits
+      - verified domain ownership (DNS TXT token or an uploaded file —
+        worth building regardless, see below)
+      - named technical contact and an agreed escalation path
+      - rate and window agreements, maintenance-window awareness
+      - full audit log of what was sent and when, retained
+      - insurance and jurisdiction review
+    Build it as a distinct authenticated application. Do not add an
+    "aggressive mode" toggle to this one; the moment that toggle exists,
+    the free service's legal position becomes arguable.
+
+  WORTH BUILDING FOR THE FREE TIER ANYWAY
+    Domain-ownership verification (DNS TXT token) as an *optional* step that
+    unlocks the heavier passive checks — CT enumeration, takeover detection,
+    full path catalogue. Verified owners get the deep scan; anonymous
+    visitors get Phase 1 and the headline grade. This also gives a clean
+    abuse story and a natural lead-capture point.
+
+-------------------------------------------------------------------------------
+7. OPERATIONAL AND LEGAL HARDENING (DO BEFORE PROMOTING THE SERVICE)
+-------------------------------------------------------------------------------
+
+  7.1  Shared-store rate limiting. The current limiter is in-memory and
+       per-instance, and is disabled outside production because a direct
+       localhost request has no x-forwarded-for and every local caller
+       collapsed into one bucket. Production needs Upstash or equivalent.
+
+  7.2  A published scanning policy page, linked from the scanner and from
+       the User-Agent string, stating what the scanner does and does not do,
+       the source IP ranges, and an abuse/opt-out contact. Site owners who
+       see us in their logs must be able to find out who we are in one
+       click. The User-Agent already points at a URL — that URL must exist.
+
+  7.3  Scan audit log: who (IP), what (target), when, and the consent flag.
+       Needed to answer an abuse complaint, and to detect our own form being
+       used as an attack-attribution laundering service.
+
+  7.4  Target opt-out list, honoured before any request.
+
+  7.5  Report retention and privacy decision. Reports can contain secrets
+       (post-1.1) and internal hostnames. Decide retention period, access
+       control, and whether reports are stored at all. Default to not
+       storing, which is also the cheapest answer.
+
+  7.6  Fix our own posture. The scanner's own CSP carries 'unsafe-inline'
+       for Next's bootstrap scripts — which this very tool reports as a
+       weakness. Move to nonce-based CSP via middleware so we score A+ on
+       our own check. Embarrassing not to, and it is a credibility artefact
+       a prospective client may well test.
+
+===============================================================================
+SUMMARY
+  Phase 1 and 2 are where the value is: they add findings no competing free
+  tool produces, and they add almost no load to the sites being scanned.
+  Land 5.1, 5.2 and 5.3 first — the registry, the request budget and
+  redaction — or the rest becomes unmaintainable and, in the case of secret
+  detection, actively irresponsible.
+  Keep the passive line exactly where it is. It is the product.
+===============================================================================
