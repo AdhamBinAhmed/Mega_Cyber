@@ -215,7 +215,7 @@ a:hover {
   backdrop-filter: blur(16px);
   border: 1px solid var(--hairline);
   border-radius: 999px;
-  padding: 10px 14px 10px 18px;
+  padding: 9px 14px 9px 18px;
   box-shadow: 0 20px 40px -24px rgba(0, 0, 0, 0.9);
 }
 
@@ -1628,4 +1628,44 @@ body[data-embed='true'] .hero {
   font-family: var(--mono);
   color: var(--grade-c);
   font-variant-numeric: tabular-nums;
+}
+
+/* ------------------------------- brand logo ------------------------------- */
+
+/*
+ * The wordmark is 1600x605 and carries a two-line lockup ("MEGADevs." over
+ * "Engineering Studio"), so it needs real height to stay legible — at 26px the
+ * tagline collapsed into a smudge.
+ */
+.brand-logo {
+  height: 40px;
+  width: auto;
+  max-width: 190px;
+  object-fit: contain;
+  display: block;
+  flex: none;
+}
+
+.brand-divider {
+  width: 1px;
+  height: 26px;
+  background: var(--hairline-strong);
+  flex: none;
+}
+
+.brand-logo-lg {
+  height: 58px;
+  max-width: 280px;
+  margin-bottom: 6px;
+}
+
+@media (max-width: 560px) {
+  .brand-logo {
+    height: 32px;
+    max-width: 150px;
+  }
+  .brand-divider,
+  .brand-text {
+    display: none;
+  }
 }

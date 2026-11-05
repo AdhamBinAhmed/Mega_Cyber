@@ -8,6 +8,32 @@ JSON report plus a dashboard that renders it.
 Built with Next.js 15 (App Router) + TypeScript, no runtime dependencies beyond
 React, and deployable to Vercel as-is.
 
+## Brand assets
+
+| File | Role |
+|---|---|
+| `public/megadevs-logo.png` | Wordmark, 1600x605 transparent PNG. Nav, footer, Open Graph image, `Organization` logo |
+| `src/app/icon.png` | Favicon, 480x480 square. Next's file convention emits the `<link rel="icon">` |
+| `src/app/apple-icon.png` | 180x180 touch icon |
+| `public/dark_mode_img.jpg` | The original supplied file — **actually a PNG** despite the extension; kept only so the original name still resolves |
+
+Two things worth knowing about those assets:
+
+- **The supplied `dark_mode_img.jpg` is a PNG.** Served under a `.jpg` name it
+  goes out as `Content-Type: image/jpeg`, and because this app sends
+  `X-Content-Type-Options: nosniff`, a browser is entitled to refuse to render
+  it. `megadevs-logo.png` is the same bytes under the correct extension, and is
+  what the site references.
+- **The logo needs height to stay legible.** It is a two-line lockup
+  ("MEGADevs." over "Engineering Studio") at a 2.6:1 ratio, so below about 32px
+  tall the tagline turns to mush. The nav uses 40px, the footer 58px.
+
+For the logo to appear beside the site in Google results, set
+`NEXT_PUBLIC_SITE_URL` to the real origin. The favicon covers the small icon
+next to a result; the `Organization` JSON-LD in `src/app/layout.tsx` is what
+Google reads for the larger logo in a knowledge panel. Both need absolute URLs,
+which is what that variable provides.
+
 ## Design
 
 "Red noir": pure black ground, a dark red wash, one hot accent (`#ef233c`),
@@ -37,11 +63,12 @@ All of the motion is disabled under `prefers-reduced-motion`.
 
 | Section | Weight | What it looks at |
 |---|---|---|
-| **HTTP security headers** | 30% | CSP, HSTS, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy — plus cookie flags, version-disclosing headers, and whether HTTP redirects to HTTPS |
-| **SSL / TLS** | 25% | Certificate validity, expiry, hostname coverage, chain trust, key strength; which TLS versions are accepted (1.0/1.1 flagged as weak); the Qualys SSL Labs grade |
-| **Exposed files** | 25% | A GET of 12 well-known paths (`/.env`, `/.git/config`, `/wp-config.php.bak`, `/robots.txt`, …) reporting only whether each is readable |
-| **DNS & email authentication** | 10% | SPF, DKIM, DMARC and CAA records via Node's built-in `dns` |
+| **HTTP security headers** | 24% | CSP, HSTS, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy — plus cookie flags, version-disclosing headers, and whether HTTP redirects to HTTPS |
+| **SSL / TLS** | 22% | Certificate validity, expiry, hostname coverage, chain trust, key strength; which TLS versions are accepted (1.0/1.1 flagged as weak); the Qualys SSL Labs grade |
+| **Exposed files** | 20% | A GET of 12 well-known paths (`/.env`, `/.git/config`, `/wp-config.php.bak`, `/robots.txt`, …) reporting only whether each is readable |
+| **DNS & email authentication** | 9% | SPF, DKIM, DMARC and CAA records via Node's built-in `dns` |
 | **Technology & known CVEs** | 10% | CMS/framework/library fingerprint from meta tags, headers, cookies and script URLs, correlated against a static advisory table |
+| **Page content & supply chain** | 15% | Credentials leaked in page source, Subresource Integrity gaps, mixed content, third-party script inventory, source maps, insecure forms, internal detail in comments |
 
 ## What it deliberately does not do
 
@@ -161,7 +188,7 @@ curl -X POST https://scanner.megadevs.example/api/scan \
 
 ```jsonc
 {
-  "schemaVersion": "1.0",
+  "schemaVersion": "1.1",
   "scanId": "…",
   "target": { "input": "example.com", "url": "https://example.com/", "finalUrl": "…", "resolvedIps": ["…"] },
   "overall": {
@@ -245,15 +272,46 @@ the report can be traced back to the findings that produced it.
 |---|---|---|---|---|---|---|
 | Score | ≥95 | ≥85 | ≥75 | ≥65 | ≥50 | <50 |
 
+### Credential detection and redaction
+
+The content check looks for credential shapes in page source — AWS keys, Stripe
+secret keys, GitHub and Slack tokens, private keys, and high-entropy generic
+assignments. Two rules govern it:
+
+- **No credential value is ever serialised.** Everything that reaches a report
+  goes through `src/lib/redact.ts`, which masks all but the first and last four
+  characters. Reports get downloaded, emailed and pasted into tickets; a scanner
+  that echoed the secret it found would be spreading the leak. There is a test
+  asserting a known AWS key never appears whole in output.
+- **Keys that are public by design are classified, not condemned.** A Stripe
+  `pk_live_` publishable key, a Firebase `apiKey`, a Google browser key — these
+  belong in page source. They are reported as information with advice to confirm
+  the restrictions, never as leaks. Candidates must also clear a Shannon entropy
+  bar and dodge a placeholder blocklist (`YOUR_API_KEY`, `changeme`, `${...}`),
+  because the generic pattern would otherwise fire on every minified bundle.
+
+### Request budget
+
+A scan makes around 15 requests to the target against a ceiling of 40, enforced
+in the HTTP client rather than per check, and reported in `meta.requests`. The
+ceiling exists because "passive" is a claim about volume as much as intent:
+without it, every added check quietly raises the load an anonymous visitor can
+aim at someone else's site through an embedded form. Checks that run out report
+"not assessed" rather than silently skipping.
+
 ### Avoiding false positives
 
-Two places needed deliberate care, because a confident wrong answer is worse
+Several places needed deliberate care, because a confident wrong answer is worse
 than no answer:
 
 - **Exposed files.** Plenty of sites answer `200` with their SPA shell for every
   unknown path. The scanner first requests a random path to learn what "missing"
   looks like on that server, then requires the response body to match a content
   signature for the file type before calling anything exposed.
+- **Own CDN vs third party.** A cross-origin asset host sharing the site's
+  registrable domain (`static.example.com`) is reported separately from a
+  genuinely external one. Calling a site's own CDN "a separate company that can
+  change your site" overstates the risk and makes the finding easy to dismiss.
 - **CVE matching.** Matches come from a version string in a public page, which is
   strong evidence but not proof. The published severity is preserved in
   `vulnerabilities[].severity`, but the corresponding *finding* is reported one
@@ -395,12 +453,14 @@ npm run build && npm start &   # production, strict CSP
 npm run smoke:scan http://127.0.0.1:3000/
 ```
 
-90 unit tests across the SSRF guard (including the IPv4-mapped bypasses and proof
+124 unit tests across the SSRF guard (including the IPv4-mapped bypasses and proof
 that the development escape hatch stays shut in production), grading and
 version comparison, header/CSP/cookie parsing, certificate hostname matching,
-fingerprint and CVE correlation, error description, and the dashboard rendered
-against real captured reports — one healthy site and one where the page could
-not be fetched, which is the case that exercises error sections and null data.
+fingerprint and CVE correlation, error description, credential redaction, the request budget, and the dashboard
+rendered against real captured reports — a healthy site, one where the page
+could not be fetched (which exercises error sections and null data), and a
+schema 1.0 report captured before the content section existed, proving an
+archived report still renders rather than crashing the dashboard.
 
 ---
 

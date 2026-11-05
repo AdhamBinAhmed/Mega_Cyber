@@ -206,10 +206,19 @@ export default function Page() {
         <div className="shell">
           <nav className="nav">
             <div className="brand">
-              <span className="brand-mark" aria-hidden />
+              {/* Transparent PNG, so it sits on the black ground directly. */}
+              <img
+                className="brand-logo"
+                src="/megadevs-logo.png"
+                width={1600}
+                height={605}
+                alt="MEGADevs"
+                decoding="async"
+              />
+              <span className="brand-divider" aria-hidden />
               <span className="brand-text">
-                <strong>MEGA Devs Cyber Team</strong>
-                <span>Passive Website Security Scanner</span>
+                <strong>Cyber Team</strong>
+                <span>Passive Security Scanner</span>
               </span>
             </div>
             <div className="nav-right">
@@ -312,7 +321,7 @@ export default function Page() {
               />
               <span>
                 I own this website or have permission from its owner to assess it. I understand the
-                scan sends a small number of ordinary requests from MEGA Devs infrastructure, and
+                scan sends a small number of ordinary requests from MEGADevs infrastructure, and
                 that those requests will appear in the site&rsquo;s access logs.
               </span>
             </label>
@@ -534,12 +543,15 @@ export default function Page() {
       <footer className="sitefoot">
         <div className="foot-grid">
           <div>
-            <div className="brand">
-              <span className="brand-mark" aria-hidden />
-              <span className="brand-text">
-                <strong>MEGA Devs Cyber Team</strong>
-              </span>
-            </div>
+            <img
+              className="brand-logo brand-logo-lg"
+              src="/megadevs-logo.png"
+              width={1600}
+              height={605}
+              alt="MEGADevs"
+              loading="lazy"
+              decoding="async"
+            />
             <p>
               A passive assessment is a starting point, not a penetration test. It tells you what
               an attacker learns for free, before they try anything at all.
@@ -588,7 +600,7 @@ export default function Page() {
         </div>
 
         <div className="foot-bottom">
-          <span>&copy; {new Date().getFullYear()} MEGA Devs Cyber Team</span>
+          <span>&copy; {new Date().getFullYear()} MEGADevs Engineering Studio</span>
           <span>Read-only · results are a starting point, not a penetration test</span>
         </div>
       </footer>
