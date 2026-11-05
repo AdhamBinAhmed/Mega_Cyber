@@ -2,7 +2,7 @@
   "name": "megadevs-passive-scanner",
   "version": "1.0.0",
   "private": true,
-  "description": "Passive website security scanner \u2014 MEGA Devs Cyber Team",
+  "description": "Passive website security scanner — MEGA Devs Cyber Team",
   "engines": {
     "node": ">=20.9.0"
   },
@@ -18,7 +18,7 @@
     "smoke:scan": "node scripts/smoke.mjs --scan"
   },
   "dependencies": {
-    "next": "15.5.4",
+    "next": "15.5.9",
     "react": "19.1.1",
     "react-dom": "19.1.1"
   },
