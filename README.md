@@ -77,7 +77,7 @@ request:
 
 | Check | What it looks for |
 |---|---|
-| **DOM XSS** | A URL-derived source (`location.hash`, `location.search`, `document.referrer`, `window.name`, `postMessage` data) reaching an HTML or code sink (`.innerHTML`, `.outerHTML`, `insertAdjacentHTML`, `document.write`, jQuery `.html()`, `.srcdoc`, `eval`, `new Function`, string timers) |
+| **DOM XSS** | A URL-derived source (`location.hash`, `location.search`, `document.referrer`, `window.name`, `postMessage` data) reaching an HTML or code sink (`.innerHTML`, `.outerHTML`, `insertAdjacentHTML`, `document.write`, jQuery `.html()`, `.srcdoc`, `eval`, `new Function`, string timers), in inline `<script>` and in up to five of the site's own script files |
 | **DOM open redirect** | The same sources reaching a `location` assignment |
 | **Reflected parameters** | Whether values from the submitted URL come back in the response, and in which context (HTML, attribute, script) |
 | **postMessage** | Message listeners with no visible `event.origin` check |
@@ -331,8 +331,11 @@ assignments. Two rules govern it:
 
 ### Request budget
 
-A scan makes around 15 requests to the target against a ceiling of 40, enforced
-in the HTTP client rather than per check, and reported in `meta.requests`. The
+A scan makes around 20 requests to the target against a ceiling of 50, enforced
+in the HTTP client rather than per check, and reported in `meta.requests`. Up to
+five of those are the site's own script files, read so the DOM XSS check can see
+bundled code; that fetch leaves a reserve of 20 requests untouched so it cannot
+starve the checks that follow it. The
 ceiling exists because "passive" is a claim about volume as much as intent:
 without it, every added check quietly raises the load an anonymous visitor can
 aim at someone else's site through an embedded form. Checks that run out report
@@ -531,12 +534,19 @@ Worth being upfront about with clients:
 - **No JavaScript execution.** Technologies loaded only at runtime are invisible,
   and SPA-heavy sites expose less to fingerprinting. Only the first 512 KB of
   HTML is analysed.
-- **Injection findings cover inline script only, and are leads rather than
-  proof.** Logic in bundled `.js` files is not fetched or parsed, so a DOM XSS
-  living there is invisible; conversely nothing here is confirmed, because
-  confirming it would mean sending a payload, which this scanner does not do.
+- **Injection findings are leads rather than proof, over as much script as one
+  scan can read.** Inline `<script>` plus up to five same-origin script files
+  are scanned; third-party CDN files never are, and any same-origin file left
+  unread is listed by URL in an `info` finding, because "no DOM XSS sinks" must
+  never mean "we did not look". A clean result over partial coverage earns no
+  score credit. Nothing here is confirmed either way, because confirming it
+  would mean sending a payload, which this scanner does not do.
   Reflected-parameter checks only report what the submitted URL already
   contained — the scanner never appends a parameter of its own.
+- **Minified bundles weaken the confidence ladder.** In a one-line bundle "the
+  same script" spans a router, a scheduler and a UI library, so inside minified
+  files only same-expression hits are reported and the `low` same-script tier is
+  dropped rather than fired on every site that ships React.
 - **DKIM absence is inconclusive.** Selectors are chosen by the sender and cannot
   be enumerated from DNS; the scanner probes 19 common ones and labels a miss as
   inconclusive rather than failing.
@@ -545,7 +555,11 @@ Worth being upfront about with clients:
   exploitable. It needs periodic review; entries carry a `reference` URL.
 - **The registrable-domain helper is a heuristic**, not the full Public Suffix
   List. It covers the common multi-label suffixes (`co.uk`, `com.au`, …).
-- **One page, one host.** No crawling, no subdomain enumeration.
+- **One page, one host.** No crawling, no subdomain enumeration — the only
+  extra same-origin files fetched are the page's own script bundles.
+- **A grade needs coverage.** When the page itself cannot be read, only DNS and
+  TLS run, and the score is capped at C with the reason shown next to it: a
+  weighted mean over a third of the checks is not evidence of a secure site.
 - **API checks see only what the page shows.** CORS is read from the HTML
   response rather than from each endpoint, no API is called with a crafted
   request, and GraphQL presence is established from a plain GET — no

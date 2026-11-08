@@ -65,6 +65,20 @@ const SEVERITY_CAPS: Partial<Record<Severity, { score: number; label: string }>>
   high: { score: 65, label: 'high-severity finding' },
 };
 
+/**
+ * Coverage cap: a grade built from a minority of the checks is not a grade.
+ *
+ * Renormalising the weights keeps a failed section from costing points, which
+ * is right — but taken alone it means a site whose page could not be fetched
+ * is graded on DNS and TLS and can come back A+, which reads as "this site is
+ * secure" when the honest answer is "we could not look". Below this much
+ * coverage the number is capped and the reason is shown next to it.
+ */
+const MIN_COVERAGE = 0.5;
+const COVERAGE_CAP = 65;
+
+const TOTAL_WEIGHT = Object.values(SECTION_WEIGHTS).reduce((sum, weight) => sum + weight, 0);
+
 export function clampScore(value: number): number {
   if (!Number.isFinite(value)) return 0;
   return Math.max(0, Math.min(100, Math.round(value)));
@@ -161,6 +175,12 @@ export function computeOverall(sections: ScanSections): OverallResult {
       capReason = `Grade capped at ${gradeFor(cap.score)} by ${counts[severity]} ${cap.label}${plural}.`;
       break;
     }
+  }
+
+  const coverage = TOTAL_WEIGHT > 0 ? totalWeight / TOTAL_WEIGHT : 0;
+  if (totalWeight > 0 && coverage < MIN_COVERAGE && score > COVERAGE_CAP) {
+    score = COVERAGE_CAP;
+    capReason = `Grade capped at ${gradeFor(COVERAGE_CAP)}: only ${Math.round(coverage * 100)}% of the checks could run, so there is not enough evidence for a higher grade.`;
   }
 
   const grade = totalWeight > 0 ? gradeFor(score) : 'F';

@@ -9,7 +9,12 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { analyseInjection, cspBlocksInjectedScript, inlineScripts } from '../checks/injection';
+import {
+  analyseInjection,
+  cspBlocksInjectedScript,
+  externalScriptUrls,
+  inlineScripts,
+} from '../checks/injection';
 import { runContentCheck } from '../checks/content';
 import type { RawResponse } from '../http';
 
@@ -295,5 +300,184 @@ describe('content section integration', () => {
     const section = runContentCheck(page(script('document.body.textContent = "hi";')));
     expect(section.summary).toContain('No credential leaks');
     expect(section.findings.some((finding) => finding.severity === 'high')).toBe(false);
+  });
+});
+
+/* ------------------------- external script files -------------------------- */
+
+describe('externalScriptUrls', () => {
+  it('collects same-origin script files, deduplicated and in order', () => {
+    const html =
+      '<script src="/a.js"></script>' +
+      '<script src="https://target.test/b.js"></script>' +
+      '<script src="/a.js"></script>';
+    expect(externalScriptUrls(html, URL_PLAIN)).toEqual([
+      'https://target.test/a.js',
+      'https://target.test/b.js',
+    ]);
+  });
+
+  it('leaves third-party, inline, data: and non-JavaScript tags alone', () => {
+    const html =
+      '<script src="https://cdn.other.test/x.js"></script>' +
+      '<script src="data:text/javascript,alert(1)"></script>' +
+      '<script type="application/ld+json" src="/ld.json"></script>' +
+      '<script>var inline = 1;</script>';
+    expect(externalScriptUrls(html, URL_PLAIN)).toEqual([]);
+  });
+});
+
+describe('DOM sinks in the site’s own script files', () => {
+  const page = '<html><body><script src="/static/app.js"></script></body></html>';
+
+  it('finds a sink that only exists in a fetched script file', () => {
+    const result = analyseInjection(page, URL_PLAIN, null, [
+      {
+        url: 'https://target.test/static/app.js',
+        code: 'function boot() {\n  document.body.innerHTML = location.hash.slice(1);\n}',
+      },
+    ]);
+    const finding = result.findings.find((entry) => entry.id.startsWith('injection.dom.xss'));
+    expect(finding).toBeDefined();
+    expect(finding!.severity).toBe('high');
+    // Named by file and line, or the developer cannot find it.
+    expect(finding!.evidence).toContain('app.js line ~2');
+    expect(result.data.domSinks[0]!.file).toBe('https://target.test/static/app.js');
+    expect(result.data.domSinks[0]!.line).toBe(2);
+    expect(result.data.externalScriptsAnalysed).toBe(1);
+    expect(result.data.externalScriptBytes).toBeGreaterThan(0);
+  });
+
+  it('still numbers inline sinks against the document', () => {
+    const html = '<html>\n<body>\n<script>\ndocument.body.innerHTML = location.hash;\n</script>';
+    const sink = analyseInjection(html, URL_PLAIN, null).data.domSinks[0]!;
+    expect(sink.file).toBeNull();
+    expect(sink.line).toBe(4);
+  });
+
+  it('reads postMessage listeners and document.domain writes out of script files', () => {
+    const ids = analyseInjection(page, URL_PLAIN, null, [
+      {
+        url: 'https://target.test/static/app.js',
+        code: 'window.addEventListener("message", function (e) { render(e.data); });\ndocument.domain = "target.test";',
+      },
+    ]).findings.map((finding) => finding.id);
+    expect(ids).toContain('injection.postmessage.no-origin-check');
+    expect(ids).toContain('injection.document-domain');
+  });
+
+  it('counts the bytes it read in the passing finding', () => {
+    const result = analyseInjection(page, URL_PLAIN, null, [
+      { url: 'https://target.test/static/app.js', code: 'export const safe = 1;' },
+    ]);
+    const pass = result.findings.find((finding) => finding.id === 'injection.dom.none')!;
+    expect(pass.severity).toBe('pass');
+    expect(pass.detail).toContain('same-origin script file');
+    expect(pass.scoreImpact).toBeGreaterThan(0);
+  });
+});
+
+describe('coverage honesty when script files were not read', () => {
+  const page =
+    '<html><body><script src="/a.js"></script><script src="/b.js"></script></body></html>';
+
+  it('says which files it did not read', () => {
+    const result = analyseInjection(page, URL_PLAIN, null, [], [
+      'https://target.test/a.js',
+      'https://target.test/b.js',
+    ]);
+    const note = result.findings.find((finding) => finding.id === 'injection.dom.not-analysed');
+    expect(note).toBeDefined();
+    expect(note!.evidence).toContain('https://target.test/a.js');
+    expect(result.data.externalScriptsSkipped).toBe(2);
+  });
+
+  it('awards no pass credit for a clean result over part of the code', () => {
+    const partial = analyseInjection(
+      page,
+      URL_PLAIN,
+      null,
+      [{ url: 'https://target.test/a.js', code: 'export const safe = 1;' }],
+      ['https://target.test/b.js'],
+    );
+    const pass = partial.findings.find((finding) => finding.id === 'injection.dom.none')!;
+    expect(pass.scoreImpact).toBe(0);
+    expect(pass.title).toContain('script that was read');
+  });
+
+  it('claims nothing at all when there was no script to read', () => {
+    const result = analyseInjection(page, URL_PLAIN, null, [], [
+      'https://target.test/a.js',
+      'https://target.test/b.js',
+    ]);
+    expect(result.findings.map((finding) => finding.id)).not.toContain('injection.dom.none');
+  });
+});
+
+/* --------------------- precision against bundled code --------------------- */
+
+describe('false positives that minified bundles produce', () => {
+  const page = '<html><body><script src="/app.js"></script></body></html>';
+
+  function bundle(code: string) {
+    return analyseInjection(page, URL_PLAIN, null, [
+      { url: 'https://target.test/app.js', code },
+    ]);
+  }
+
+  it('does not read a location assignment as its own source', () => {
+    // location.href is both sink and source. Matching the sink text as the
+    // source turns every static redirect in the codebase into a finding.
+    const result = bundle('function go(){ window.location.href = "/palestine"; }');
+    const redirect = result.findings.find((finding) => finding.id.includes('dom.redirect'));
+    expect(redirect).toBeUndefined();
+    expect(result.data.domSinks[0]!.proximity).not.toBe('expression');
+  });
+
+  it('still flags a navigation target that really is built from the URL', () => {
+    const result = bundle('location.href = location.hash.slice(1);');
+    expect(result.findings.some((finding) => finding.id.includes('dom.redirect'))).toBe(true);
+    expect(result.data.domSinks.some((sink) => sink.proximity === 'expression')).toBe(true);
+  });
+
+  it('drops the same-script tier inside a minified file', () => {
+    // A framework runtime: a sink and a URL read, tens of kilobytes apart on
+    // one line. Reporting that as a lead means reporting it for every site
+    // that ships React.
+    const filler = 'var a=1;'.repeat(4000);
+    const result = bundle(`${filler}e.innerHTML=t;${filler}var u=location.href;${filler}`);
+    expect(result.findings.map((finding) => finding.id)).not.toContain(
+      'injection.dom.sink-and-source',
+    );
+    expect(result.data.domSinks.every((sink) => sink.proximity !== 'script')).toBe(true);
+  });
+
+  it('keeps the same-script tier in readable code', () => {
+    // Far enough apart not to share an expression, but readable code, so
+    // "same script" is still a pointer worth tracing.
+    const gap = Array.from({ length: 40 }, (_, i) => `var pad${i} = ${i};`).join('\n');
+    const result = bundle(
+      `var raw = location.search;\n${gap}\nfunction render(v) {\n  document.body.innerHTML = v;\n}\n`,
+    );
+    expect(result.findings.map((finding) => finding.id)).toContain(
+      'injection.dom.sink-and-source',
+    );
+  });
+
+  it('ignores a MessageChannel port, which no other window can post to', () => {
+    const result = bundle(
+      'var ch = new MessageChannel(), p = ch.port2; ch.port1.onmessage = flush;',
+    );
+    expect(result.findings.map((finding) => finding.id)).not.toContain(
+      'injection.postmessage.no-origin-check',
+    );
+    expect(result.data.postMessageListeners).toBe(0);
+  });
+
+  it('still flags a real window message listener', () => {
+    const result = bundle('window.addEventListener("message", function (e) { use(e.data); });');
+    expect(result.findings.map((finding) => finding.id)).toContain(
+      'injection.postmessage.no-origin-check',
+    );
   });
 });

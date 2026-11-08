@@ -11,7 +11,8 @@ import { SCANNER_NAME, SCANNER_VERSION, config } from './config';
 import { computeOverall, errorSection } from './scoring';
 import { describeError } from './errors';
 import { parseTarget, resolveTarget } from './target';
-import { requestFollowingRedirects, type RawResponse } from './http';
+import { rawRequest, requestFollowingRedirects, type RawResponse } from './http';
+import { externalScriptUrls, type ExternalScript } from './checks/injection';
 import { runHeadersCheck } from './checks/headers';
 import { runDnsCheck } from './checks/dns';
 import { runExposureCheck } from './checks/exposure';
@@ -69,6 +70,53 @@ export interface ScanOptions {
   sslLabsTimeoutMs?: number;
 }
 
+/**
+ * Fetch the site's own script files so the DOM XSS scan can read them.
+ *
+ * Needed because a bundled app (Next, Vue, anything with a build step) keeps
+ * every line of its client code in files, so an inline-only scan reports "no
+ * DOM XSS sinks" on a site it never actually looked at. Deliberately bounded:
+ * same-origin only, a small file cap, sequential, and spending the same
+ * per-scan request budget as every other check. Whatever does not fit comes
+ * back as `skipped` and is named in the report rather than quietly dropped.
+ */
+export async function fetchOwnScripts(
+  html: string,
+  base: URL,
+  budget: RequestBudget,
+  collector?: { ips: string[] },
+): Promise<{ scripts: ExternalScript[]; skipped: string[] }> {
+  const urls = externalScriptUrls(html, base);
+  const scripts: ExternalScript[] = [];
+  const skipped: string[] = [];
+
+  for (const [index, url] of urls.entries()) {
+    if (index >= config.maxScriptFiles || budget.remaining <= config.scriptFetchReserve) {
+      skipped.push(url);
+      continue;
+    }
+    try {
+      const response = await rawRequest(
+        new URL(url),
+        { budget, maxBytes: config.maxScriptBytes, timeoutMs: config.scriptTimeoutMs },
+        collector,
+      );
+      // A 404 or an HTML error page is not script; reading it would only
+      // produce findings about the error template.
+      const type = response.headers['content-type'] ?? '';
+      if (response.status >= 400 || (type && !/javascript|ecmascript|text\/plain/i.test(type))) {
+        skipped.push(url);
+        continue;
+      }
+      scripts.push({ url: response.url, code: response.body });
+    } catch {
+      skipped.push(url);
+    }
+  }
+
+  return { scripts, skipped };
+}
+
 export async function runScan(input: string, options: ScanOptions = {}): Promise<ScanReport> {
   const startedAt = new Date();
   const scanId = randomUUID();
@@ -110,7 +158,8 @@ export async function runScan(input: string, options: ScanOptions = {}): Promise
 
   const timeBudget = config.totalBudgetMs;
 
-  const [headersOutcome, dnsOutcome, exposureOutcome, tlsOutcome] = await Promise.allSettled([
+  const [headersOutcome, dnsOutcome, exposureOutcome, tlsOutcome, scriptsOutcome] =
+    await Promise.allSettled([
     mainResponse
       ? withBudget('Header analysis', timeBudget, () =>
           runHeadersCheck(parsed.url, mainResponse!, redirectChain, budget),
@@ -123,7 +172,22 @@ export async function runScan(input: string, options: ScanOptions = {}): Promise
     withBudget('TLS inspection', timeBudget, () =>
       runTlsCheck(parsed.hostname, tlsPort, { sslLabsTimeoutMs: options.sslLabsTimeoutMs }),
     ),
+    mainResponse
+      ? withBudget('Script-file fetch', timeBudget, () =>
+          fetchOwnScripts(mainResponse!.body, new URL(mainResponse!.url), budget, collector),
+        )
+      : Promise.resolve({ scripts: [], skipped: [] }),
   ]);
+
+  // On a timeout or a crash here, every script file the page references counts
+  // as skipped, so the DOM XSS finding says what it did not read.
+  const referencedScripts = mainResponse
+    ? externalScriptUrls(mainResponse.body, new URL(mainResponse.url))
+    : [];
+  const ownScripts =
+    scriptsOutcome.status === 'fulfilled' && !('__timedOut' in scriptsOutcome.value)
+      ? scriptsOutcome.value
+      : { scripts: [], skipped: referencedScripts };
 
   const sections: ScanSections = {
     headers: settle('headers', headersOutcome),
@@ -134,7 +198,7 @@ export async function runScan(input: string, options: ScanOptions = {}): Promise
       ? runFingerprintCheck(mainResponse)
       : errorSection('fingerprint', fetchError || 'the site did not respond'),
     content: mainResponse
-      ? runContentCheck(mainResponse)
+      ? runContentCheck(mainResponse, ownScripts.scripts, ownScripts.skipped)
       : errorSection('content', fetchError || 'the site did not respond'),
   };
 
@@ -146,6 +210,14 @@ export async function runScan(input: string, options: ScanOptions = {}): Promise
   if (mainResponse?.truncated) {
     notes.push(
       `Only the first ${Math.round(config.maxBodyBytes / 1024)} KB of the page was analysed.`,
+    );
+  }
+  if (ownScripts.scripts.length > 0 || ownScripts.skipped.length > 0) {
+    notes.push(
+      `${ownScripts.scripts.length} of ${referencedScripts.length} same-origin script file${referencedScripts.length === 1 ? '' : 's'} were read for the DOM XSS check` +
+        (ownScripts.skipped.length > 0
+          ? `; the remaining ${ownScripts.skipped.length} ${ownScripts.skipped.length === 1 ? 'was' : 'were'} not, so that check does not cover ${ownScripts.skipped.length === 1 ? 'it' : 'them'}.`
+          : '.'),
     );
   }
   if (sections.tls.status === 'pending') {

@@ -5,6 +5,12 @@ function num(value: string | undefined, fallback: number): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+/** Like num(), for settings where zero is a meaningful value rather than unset. */
+function count(value: string | undefined, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
 function flag(value: string | undefined, fallback: boolean): boolean {
   if (value === undefined) return fallback;
   return ['1', 'on', 'true', 'yes'].includes(value.trim().toLowerCase());
@@ -43,6 +49,24 @@ export const config = {
   /** Redirects we follow manually, re-validating the target at every hop. */
   maxRedirects: num(process.env.SCAN_MAX_REDIRECTS, 5),
 
+  /**
+   * Same-origin script files read per scan for the DOM XSS check.
+   *
+   * A bundled app keeps all of its client code in files, so scanning only
+   * inline <script> means reporting "no DOM XSS sinks" without having read the
+   * code. These bound how much of the bundle one scan will pull: enough to
+   * cover a typical entry chunk or two, not enough to become a crawl.
+   */
+  maxScriptFiles: num(process.env.SCAN_MAX_SCRIPT_FILES, 5),
+  maxScriptBytes: num(process.env.SCAN_MAX_SCRIPT_BYTES, 512 * 1024),
+  scriptTimeoutMs: num(process.env.SCAN_SCRIPT_TIMEOUT_MS, 6_000),
+  /**
+   * Requests left untouched for the checks that run after this one. Without a
+   * reserve, a page listing forty bundles would spend the whole allowance on
+   * script files and the exposed-files sweep would report "not assessed".
+   */
+  scriptFetchReserve: count(process.env.SCAN_SCRIPT_FETCH_RESERVE, 20),
+
   /** Parallel requests during the exposed-files sweep. Deliberately gentle. */
   exposureConcurrency: num(process.env.SCAN_EXPOSURE_CONCURRENCY, 3),
 
@@ -51,7 +75,7 @@ export const config = {
    * HTTP client. Checks that run out report "not assessed" rather than
    * silently skipping, so the report stays honest about its own coverage.
    */
-  requestBudget: num(process.env.SCAN_REQUEST_BUDGET, 40),
+  requestBudget: num(process.env.SCAN_REQUEST_BUDGET, 50),
 
   rateLimit: {
     /**

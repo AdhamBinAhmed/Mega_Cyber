@@ -127,6 +127,49 @@ describe('computeOverall', () => {
     expect(result.grade).toBe('F');
   });
 
+  it('caps the grade when most of the checks could not run', () => {
+    // The page could not be fetched: headers, exposure, fingerprint and
+    // content all error out and only TLS and DNS are left. They are perfect,
+    // but an A+ here would read as "this site is secure" when the honest
+    // answer is "we could not look".
+    const result = computeOverall(
+      sections({
+        headers: errorSection('headers', 'ETIMEDOUT'),
+        exposure: errorSection('exposure', 'ETIMEDOUT'),
+        fingerprint: errorSection('fingerprint', 'ETIMEDOUT'),
+        content: errorSection('content', 'ETIMEDOUT'),
+      }),
+    );
+    expect(result.score).toBe(65);
+    expect(result.grade).toBe('C');
+    expect(result.capReason).toMatch(/only 31% of the checks could run/i);
+  });
+
+  it('leaves a well-covered scan uncapped', () => {
+    // Only DNS missing: 91% of the weight still ran, which is plenty.
+    const result = computeOverall(
+      sections({ content: buildSection('content', null, [], '', 0), dns: errorSection('dns', 'x') }),
+    );
+    expect(result.score).toBe(100);
+    expect(result.grade).toBe('A+');
+    expect(result.capReason).toBeNull();
+  });
+
+  it('does not lift a poor score up to the coverage cap', () => {
+    const result = computeOverall(
+      sections({
+        headers: errorSection('headers', 'x'),
+        exposure: errorSection('exposure', 'x'),
+        fingerprint: errorSection('fingerprint', 'x'),
+        content: errorSection('content', 'x'),
+        tls: buildSection('tls', null, [finding(-80)], '', 0),
+        dns: buildSection('dns', null, [finding(-80)], '', 0),
+      }),
+    );
+    expect(result.score).toBe(20);
+    expect(result.capReason).toBeNull();
+  });
+
   it('reports F when nothing could be scored at all', () => {
     const all = sections({
       headers: errorSection('headers', 'x'),

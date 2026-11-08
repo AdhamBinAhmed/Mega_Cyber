@@ -15,7 +15,7 @@
  * 1.0 consumer still works, and the dashboard renders an older report by
  * simply omitting the parts it lacks.
  */
-export const SCHEMA_VERSION = '1.3' as const;
+export const SCHEMA_VERSION = '1.4' as const;
 
 export type Grade = 'A+' | 'A' | 'B' | 'C' | 'D' | 'F';
 
@@ -303,6 +303,11 @@ export interface DomSinkObservation {
   proximity: 'expression' | 'script' | 'none';
   line: number;
   snippet: string;
+  /**
+   * Script file the sink was found in, or null for an inline <script>. Line
+   * numbers are relative to whichever of the two it is.
+   */
+  file: string | null;
 }
 
 export interface ReflectedParamObservation {
@@ -317,6 +322,15 @@ export interface ReflectedParamObservation {
 export interface InjectionData {
   inlineScriptCount: number;
   inlineScriptBytes: number;
+  /** Same-origin script files fetched and scanned for sinks. */
+  externalScriptsAnalysed: number;
+  externalScriptBytes: number;
+  /**
+   * Same-origin script files referenced by the page but not scanned, because
+   * the per-scan file cap, request budget or time budget ran out. Reported, so
+   * "no DOM XSS sinks" never means "we did not look".
+   */
+  externalScriptsSkipped: number;
   inlineEventHandlers: number;
   domSinks: DomSinkObservation[];
   postMessageListeners: number;

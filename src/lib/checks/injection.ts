@@ -4,9 +4,10 @@
  *
  * Still strictly passive. Nothing here sends a payload, probes a parameter or
  * executes a line of JavaScript — every judgement comes from reading the HTML
- * the scanner already fetched. That buys honesty at the cost of certainty: a
- * regex cannot prove that location.hash reaches innerHTML through three
- * function calls, and it cannot prove the opposite either.
+ * the scanner already fetched, plus the site's own same-origin script files,
+ * which is where a bundled app keeps all of its code. That buys honesty at the
+ * cost of certainty: a regex cannot prove that location.hash reaches innerHTML
+ * through three function calls, and it cannot prove the opposite either.
  *
  * So the severity ladder encodes confidence as much as impact:
  *
@@ -123,6 +124,86 @@ export interface InlineScript {
   offset: number;
 }
 
+/** A same-origin script file the scanner fetched, so its code can be read. */
+export interface ExternalScript {
+  /** Absolute URL, used as the evidence label. */
+  url: string;
+  code: string;
+}
+
+/** One body of JavaScript to scan, inline or from a file. */
+interface ScriptUnit {
+  code: string;
+  /** Script URL, or null when the code is inline in the document. */
+  file: string | null;
+  /** Line number, within the containing document or file, of code[0]. */
+  startLine: number;
+}
+
+/**
+ * Minified code: a lot of it, packed into very few lines.
+ *
+ * Worth detecting because proximity is the whole basis of the confidence
+ * ladder here, and minification destroys it — a build tool concatenates a
+ * router, a scheduler and a UI library onto one line, after which "the same
+ * script" means nothing.
+ */
+function isMinified(code: string): boolean {
+  const lines = code.split('\n').length;
+  return code.length > 20_000 && code.length / lines > 2_000;
+}
+
+/** Newlines in text before `end`. */
+function lineOffset(text: string, end: number): number {
+  let lines = 0;
+  for (let i = 0; i < end && i < text.length; i += 1) if (text[i] === '\n') lines += 1;
+  return lines;
+}
+
+/** Short label for a script file: its path, which is what a developer greps. */
+function fileLabel(url: string): string {
+  try {
+    return new URL(url).pathname.split('/').filter(Boolean).pop() ?? url;
+  } catch {
+    return url;
+  }
+}
+
+/** "line ~12" for inline code, "app.js line ~12" for a file. */
+function locate(sink: DomSinkObservation): string {
+  return sink.file ? `${fileLabel(sink.file)} line ~${sink.line}` : `line ~${sink.line}`;
+}
+
+/**
+ * Same-origin `<script src>` URLs, in document order, deduplicated.
+ *
+ * Same-origin only, deliberately: a bundled app keeps its own code on its own
+ * origin, and pulling third-party CDN files would mean spending the request
+ * budget on hosts the operator did not ask us to touch.
+ */
+export function externalScriptUrls(html: string, base: URL): string[] {
+  const out: string[] = [];
+  for (const match of html.matchAll(/<script\b([^>]*)>/gi)) {
+    const attrs = match[1] ?? '';
+    const src = attrs.match(/\bsrc\s*=\s*("([^"]*)"|'([^']*)'|([^\s>]+))/i);
+    const raw = src?.[2] ?? src?.[3] ?? src?.[4];
+    if (!raw) continue;
+    const type = attrs.match(/\btype\s*=\s*["']?([^"'\s>]+)/i)?.[1]?.toLowerCase();
+    if (type && !/javascript|module/.test(type)) continue;
+    let url: URL;
+    try {
+      url = new URL(raw, base);
+    } catch {
+      continue;
+    }
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') continue;
+    if (url.origin !== base.origin) continue;
+    const key = url.toString();
+    if (!out.includes(key)) out.push(key);
+  }
+  return out;
+}
+
 /** Inline script bodies, skipping src= tags and non-JavaScript types. */
 export function inlineScripts(html: string): InlineScript[] {
   const out: InlineScript[] = [];
@@ -211,6 +292,10 @@ export function analyseInjection(
   html: string,
   pageUrl: URL,
   csp: string | null,
+  /** Same-origin script files the scanner fetched, scanned alongside inline code. */
+  externalScripts: ExternalScript[] = [],
+  /** Same-origin script URLs referenced but not fetched, for the coverage note. */
+  skippedScripts: string[] = [],
 ): { findings: Finding[]; data: InjectionData } {
   const findings: Finding[] = [];
   const mitigated = cspBlocksInjectedScript(csp);
@@ -219,35 +304,50 @@ export function analyseInjection(
     ? ' Severity is reduced one level because the CSP pins inline script to a nonce or hash, which blocks the usual route to this.'
     : '';
 
-  const lineAt = (index: number): number => {
-    let line = 1;
-    for (let i = 0; i < index && i < html.length; i += 1) if (html[i] === '\n') line += 1;
-    return line;
-  };
-
   /* ---------------------------- DOM XSS sinks ---------------------------- */
   const scripts = inlineScripts(html);
   const inlineScriptBytes = scripts.reduce((sum, script) => sum + script.code.length, 0);
+  const externalScriptBytes = externalScripts.reduce((sum, file) => sum + file.code.length, 0);
+
+  // Inline code and fetched files are scanned the same way; only the line
+  // numbering differs, since an inline body is quoted against the document and
+  // a file against itself.
+  const units: ScriptUnit[] = [
+    ...scripts.map((script) => ({
+      code: script.code,
+      file: null,
+      startLine: lineOffset(html, script.offset) + 1,
+    })),
+    ...externalScripts.map((file) => ({ code: file.code, file: file.url, startLine: 1 })),
+  ];
 
   const sinks: DomSinkObservation[] = [];
-  for (const script of scripts) {
-    const scriptSource = sourceIn(script.code);
+  for (const unit of units) {
+    const scriptSource = sourceIn(unit.code);
+    // In a minified bundle the whole file is one line, so "a source appears
+    // somewhere in this script" is true of every framework runtime ever
+    // shipped and points at nothing. Only same-expression hits survive there.
+    const scriptProximityMeaningful = !isMinified(unit.code);
     for (const spec of SINKS) {
       const re = new RegExp(spec.re.source, spec.re.flags);
       let match: RegExpExecArray | null;
       let perSink = 0;
-      while ((match = re.exec(script.code)) !== null && perSink < 3) {
-        const near = script.code.slice(
-          Math.max(0, match.index - NEAR_BEFORE),
-          match.index + match[0].length + NEAR_AFTER,
-        );
-        const nearSource = sourceIn(near);
+      while ((match = re.exec(unit.code)) !== null && perSink < 3) {
+        // The matched sink text is cut out of the window: location.href is
+        // both a sink and a source, and without this `location.href = "/x"`
+        // reports itself as an attacker-controlled redirect.
+        const before = unit.code.slice(Math.max(0, match.index - NEAR_BEFORE), match.index);
+        const end = match.index + match[0].length;
+        const after = unit.code.slice(end, end + NEAR_AFTER);
+        const nearSource = sourceIn(`${before} ${after}`);
+        const carried = scriptProximityMeaningful ? scriptSource : null;
         sinks.push({
           sink: spec.label,
-          source: nearSource ?? scriptSource,
-          proximity: nearSource ? 'expression' : scriptSource ? 'script' : 'none',
-          line: lineAt(script.offset + match.index),
-          snippet: snippet(script.code, match.index),
+          source: nearSource ?? carried,
+          proximity: nearSource ? 'expression' : carried ? 'script' : 'none',
+          line: unit.startLine + lineOffset(unit.code, match.index),
+          snippet: snippet(unit.code, match.index),
+          file: unit.file,
         });
         perSink += 1;
       }
@@ -280,13 +380,13 @@ export function analyseInjection(
       status: 'warn',
       detail:
         (navigation
-          ? 'Inline script assigns a navigation target from a value an attacker controls through the URL. Unless that value is validated against an allowlist, a crafted link can bounce visitors to any site, which is the standard way a phishing page borrows your domain for credibility.'
-          : `Inline script passes a value an attacker controls through the URL into ${kind}, which parses its input as markup or code. If nothing sanitises it in between, a crafted link runs script in your origin — no server-side bug required, and a payload after the "#" never reaches your logs.`) +
+          ? 'Page script assigns a navigation target from a value an attacker controls through the URL. Unless that value is validated against an allowlist, a crafted link can bounce visitors to any site, which is the standard way a phishing page borrows your domain for credibility.'
+          : `Page script passes a value an attacker controls through the URL into ${kind}, which parses its input as markup or code. If nothing sanitises it in between, a crafted link runs script in your origin — no server-side bug required, and a payload after the "#" never reaches your logs.`) +
         ' The scanner reads source without executing it, so it cannot see a sanitiser sitting in the middle: treat this as a lead to confirm by hand, not a proven bug.' +
         cspNote,
       evidence: group
         .slice(0, 3)
-        .map((sink) => `line ~${sink.line}: ${sink.snippet}`)
+        .map((sink) => `${locate(sink)}: ${sink.snippet}`)
         .join('\n'),
       recommendation: navigation
         ? 'Validate the target against an allowlist of paths or origins before assigning it, and never pass user input straight to location.'
@@ -304,10 +404,10 @@ export function analyseInjection(
       severity: 'low',
       status: 'warn',
       detail:
-        'The same inline script both reads attacker-controllable input and writes markup or evaluates code, but not in the same expression. That is the shape DOM XSS takes once a value passes through a variable or a helper, so it is worth tracing. It is equally the shape of perfectly safe code.',
+        'The same script both reads attacker-controllable input and writes markup or evaluates code, but not in the same expression. That is the shape DOM XSS takes once a value passes through a variable or a helper, so it is worth tracing. It is equally the shape of perfectly safe code.',
       evidence: sameScript
         .slice(0, 4)
-        .map((sink) => `line ~${sink.line}: ${sink.sink} — ${sink.snippet}`)
+        .map((sink) => `${locate(sink)}: ${sink.sink} — ${sink.snippet}`)
         .join('\n'),
       recommendation:
         'Trace each value from the URL to the sink and confirm it is escaped or sanitised on the way.',
@@ -320,7 +420,7 @@ export function analyseInjection(
     const kinds = [...new Set(inventory.map((sink) => sink.sink))];
     findings.push({
       id: 'injection.dom.sinks-present',
-      title: `${kinds.length} HTML or code sink${kinds.length === 1 ? '' : 's'} used in inline script`,
+      title: `${kinds.length} HTML or code sink${kinds.length === 1 ? '' : 's'} used in page script`,
       severity: 'info',
       status: 'info',
       detail:
@@ -331,14 +431,44 @@ export function analyseInjection(
     });
   }
 
-  if (sinks.length === 0 && scripts.length > 0) {
+  // What the sink scan actually read, stated in the finding itself: "no DOM
+  // XSS sinks" has to mean "we looked", and on a bundled app almost all of the
+  // code lives in files rather than in the document.
+  const scanned =
+    `${(inlineScriptBytes / 1024).toFixed(1)} KB of inline script` +
+    (externalScripts.length > 0
+      ? ` and ${(externalScriptBytes / 1024).toFixed(1)} KB across ${externalScripts.length} same-origin script file${externalScripts.length === 1 ? '' : 's'}`
+      : '');
+
+  if (skippedScripts.length > 0) {
+    findings.push({
+      id: 'injection.dom.not-analysed',
+      title: `${skippedScripts.length} script file${skippedScripts.length === 1 ? '' : 's'} not read, so the DOM XSS check does not cover ${skippedScripts.length === 1 ? 'it' : 'them'}`,
+      severity: 'info',
+      status: 'info',
+      detail:
+        'The page loads these same-origin script files, and the scanner did not read them — it fetches a limited number per scan so one report cannot turn into a crawl of your whole bundle. A DOM XSS sink inside one of these would not appear anywhere in this report, so the result above is a statement about the code that was read, not about the site.',
+      evidence: skippedScripts.slice(0, 5).join('\n'),
+      recommendation:
+        'Review these files for DOM sinks by hand, or scan a page that loads fewer script files so the whole surface fits in one pass.',
+      scoreImpact: 0,
+      references: [REF_DOM_XSS],
+    });
+  }
+
+  if (sinks.length === 0 && units.length > 0) {
     findings.push({
       id: 'injection.dom.none',
-      title: 'No DOM XSS sinks in inline script',
+      title:
+        skippedScripts.length > 0
+          ? 'No DOM XSS sinks in the script that was read'
+          : 'No DOM XSS sinks in page script',
       severity: 'pass',
       status: 'pass',
-      detail: `Checked ${SINKS.length} sink patterns against ${(inlineScriptBytes / 1024).toFixed(1)} KB of inline script.`,
-      scoreImpact: 3,
+      detail: `Checked ${SINKS.length} sink patterns against ${scanned}.`,
+      // No credit when the coverage is partial: a clean result over part of
+      // the code is not evidence of a clean site.
+      scoreImpact: skippedScripts.length > 0 ? 0 : 3,
     });
   }
 
@@ -349,18 +479,27 @@ export function analyseInjection(
   let postMessageOriginChecks = 0;
   const unchecked: string[] = [];
 
-  for (const script of scripts) {
+  for (const unit of units) {
     const re = /addEventListener\s*\(\s*['"`]message['"`]|\bonmessage\s*=(?!=)/gi;
     let match: RegExpExecArray | null;
-    while ((match = re.exec(script.code)) !== null) {
+    while ((match = re.exec(unit.code)) !== null) {
+      // A MessageChannel port, a Worker or a socket is not the window: nobody
+      // else can post to it, so there is no origin to check. React's scheduler
+      // ships a MessageChannel in every bundle, and counting it as an unchecked
+      // cross-window listener is a finding about the framework, not the site.
+      const receiver = unit.code.slice(Math.max(0, match.index - 60), match.index);
+      if (/(?:port\d?|worker|socket|ws|channel|mc|sw|registration)\s*\.\s*$/i.test(receiver)) {
+        continue;
+      }
       postMessageListeners += 1;
-      const body = script.code.slice(match.index, match.index + 900);
+      const body = unit.code.slice(match.index, match.index + 900);
       if (/\.\s*origin\b|\boriginIsAllowed\b|\.\s*source\s*(?:===|!==|==|!=)/i.test(body)) {
         postMessageOriginChecks += 1;
       } else {
-        unchecked.push(
-          `line ~${lineAt(script.offset + match.index)}: ${snippet(script.code, match.index)}`,
-        );
+        const where = unit.file
+          ? `${fileLabel(unit.file)} line ~${unit.startLine + lineOffset(unit.code, match.index)}`
+          : `line ~${unit.startLine + lineOffset(unit.code, match.index)}`;
+        unchecked.push(`${where}: ${snippet(unit.code, match.index)}`);
       }
     }
   }
@@ -501,8 +640,8 @@ export function analyseInjection(
   }
 
   /* --------------------------- document.domain --------------------------- */
-  const documentDomainWrites = scripts.reduce(
-    (sum, script) => sum + [...script.code.matchAll(/\bdocument\s*\.\s*domain\s*=(?!=)/g)].length,
+  const documentDomainWrites = units.reduce(
+    (sum, unit) => sum + [...unit.code.matchAll(/\bdocument\s*\.\s*domain\s*=(?!=)/g)].length,
     0,
   );
 
@@ -557,6 +696,9 @@ export function analyseInjection(
   const data: InjectionData = {
     inlineScriptCount: scripts.length,
     inlineScriptBytes,
+    externalScriptsAnalysed: externalScripts.length,
+    externalScriptBytes,
+    externalScriptsSkipped: skippedScripts.length,
     inlineEventHandlers,
     domSinks: sinks.slice(0, 25),
     postMessageListeners,

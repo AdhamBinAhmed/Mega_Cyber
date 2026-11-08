@@ -1,10 +1,11 @@
 /**
  * Page content analysis.
  *
- * Everything here reads the document the scanner already fetched — no extra
- * request to the target, no JavaScript executed. It is the cheapest tier of
- * check in the whole scanner and, because leaked credentials and unpinned
- * third-party script live here, among the most valuable.
+ * Everything here reads the document the scanner already fetched, plus the
+ * site's own script files the orchestrator hands in — no JavaScript executed.
+ * It is the cheapest tier of check in the whole scanner and, because leaked
+ * credentials and unpinned third-party script live here, among the most
+ * valuable.
  *
  * Accuracy discipline: a confident wrong "you are leaking an AWS key" costs
  * more trust than ten missed findings, so candidates must clear an entropy
@@ -14,7 +15,9 @@
  * The client-side injection surface (DOM XSS, reflected parameters,
  * postMessage, CSRF tokens) and the API surface it leaks (CORS, endpoint
  * inventory, tokens, internal hosts) are analysed from the same document by
- * ./injection and ./api, and folded in here, so they cost no extra request.
+ * ./injection and ./api, and folded in here. The only requests any of this
+ * costs are the site's own script files, which the orchestrator fetches
+ * against the shared budget and passes in.
  */
 
 import type { ContentData, Finding, SectionReport, Severity } from '../types';
@@ -22,7 +25,7 @@ import { buildSection, sortFindings } from '../scoring';
 import type { RawResponse } from '../http';
 import { entropy, looksLikeRealSecret, maskValue, redact } from '../redact';
 import { EXAMPLE_MARKERS, SECRET_PATTERNS } from '../data/secrets';
-import { analyseInjection } from './injection';
+import { analyseInjection, type ExternalScript } from './injection';
 import { analyseApiSurface } from './api';
 import { registrableDomain } from '../target';
 
@@ -157,6 +160,14 @@ const SECRET_PENALTY: Record<Severity, number> = {
 
 export function runContentCheck(
   response: RawResponse,
+  /**
+   * Same-origin script files the orchestrator fetched for the DOM XSS scan,
+   * and the ones it had to leave out. Passed in rather than fetched here so
+   * this module stays free of network access and the request budget stays in
+   * one place.
+   */
+  fetchedScripts: ExternalScript[] = [],
+  skippedScripts: string[] = [],
 ): SectionReport<ContentData> {
   const startedAt = Date.now();
   const findings: Finding[] = [];
@@ -531,6 +542,8 @@ export function runContentCheck(
     response.headers['content-security-policy'] ??
       response.headers['content-security-policy-report-only'] ??
       null,
+    fetchedScripts,
+    skippedScripts,
   );
   findings.push(...injection.findings);
 

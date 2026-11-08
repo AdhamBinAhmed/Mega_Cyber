@@ -22,6 +22,15 @@ function Fact({ label, value }: { label: string; value: React.ReactNode }) {
   );
 }
 
+/** Script URL reduced to its filename, which is what the report has room for. */
+function fileName(url: string): string {
+  try {
+    return new URL(url).pathname.split('/').filter(Boolean).pop() ?? url;
+  } catch {
+    return url;
+  }
+}
+
 function Yes() {
   return <span style={{ color: 'var(--sev-pass)' }}>yes</span>;
 }
@@ -426,7 +435,7 @@ function ContentDetails({ data }: { data: ContentData }) {
                         : undefined,
                 }}
               >
-                line ~{sink.line} · {sink.sink}
+                {sink.file ? `${fileName(sink.file)} ` : ''}line ~{sink.line} · {sink.sink}
                 {sink.source ? ` ← ${sink.source}` : ''}
                 {sink.proximity === 'script' ? '  (same script, not same expression)' : ''}
               </div>
@@ -565,6 +574,20 @@ function ContentDetails({ data }: { data: ContentData }) {
               value={`${injection.postFormsWithoutToken} of ${injection.postFormCount}`}
             />
             <Fact label="Inline event handlers" value={injection.inlineEventHandlers} />
+            <Fact
+              label="Script files read"
+              value={`${injection.externalScriptsAnalysed ?? 0} (${((injection.externalScriptBytes ?? 0) / 1024).toFixed(1)} KB)`}
+            />
+            {(injection.externalScriptsSkipped ?? 0) > 0 && (
+              <Fact
+                label="Script files not read"
+                value={
+                  <span style={{ color: SEVERITY_COLOR.low }}>
+                    {injection.externalScriptsSkipped}
+                  </span>
+                }
+              />
+            )}
           </>
         )}
         {api && (
