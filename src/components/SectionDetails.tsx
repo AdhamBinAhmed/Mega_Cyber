@@ -5,7 +5,9 @@ import type {
   DnsData,
   ExposureData,
   FingerprintData,
+  ApiSurfaceData,
   HeadersData,
+  InjectionData,
   SectionReport,
   TlsData,
 } from '@/lib/types';
@@ -342,6 +344,13 @@ function FingerprintDetails({ data }: { data: FingerprintData }) {
 /* ------------------------------- content ---------------------------------- */
 
 function ContentDetails({ data }: { data: ContentData }) {
+  // Reports produced before schema 1.2 have no injection payload.
+  const injection = data.injection as InjectionData | undefined;
+  const taintedSinks =
+    injection?.domSinks.filter((sink) => sink.proximity === 'expression').length ?? 0;
+  // Reports produced before schema 1.3 have no API surface payload.
+  const api = data.apiSurface as ApiSurfaceData | undefined;
+
   return (
     <>
       {data.secrets.length > 0 && (
@@ -399,6 +408,123 @@ function ContentDetails({ data }: { data: ContentData }) {
         </>
       )}
 
+      {injection && injection.domSinks.length > 0 && (
+        <>
+          <div className="subhead">
+            Client-side sinks ({injection.domSinks.length})
+          </div>
+          <div className="evidence">
+            {injection.domSinks.slice(0, 10).map((sink, index) => (
+              <div
+                key={`${sink.sink}-${sink.line}-${index}`}
+                style={{
+                  color:
+                    sink.proximity === 'expression'
+                      ? SEVERITY_COLOR.high
+                      : sink.proximity === 'script'
+                        ? SEVERITY_COLOR.low
+                        : undefined,
+                }}
+              >
+                line ~{sink.line} · {sink.sink}
+                {sink.source ? ` ← ${sink.source}` : ''}
+                {sink.proximity === 'script' ? '  (same script, not same expression)' : ''}
+              </div>
+            ))}
+          </div>
+          <p style={{ fontSize: 12, color: 'var(--text-ghost)', margin: '8px 0 0' }}>
+            Read from source without executing it — a sanitiser between source and sink is
+            invisible here, so confirm each lead by hand.
+          </p>
+        </>
+      )}
+
+      {injection && injection.reflectedParams.length > 0 && (
+        <>
+          <div className="subhead">Reflected URL parameters</div>
+          <div className="evidence">
+            {injection.reflectedParams.map((entry) => (
+              <div
+                key={`${entry.param}-${entry.context}`}
+                style={{ color: entry.rawSpecialChars ? SEVERITY_COLOR.high : undefined }}
+              >
+                {entry.param} → {entry.context} context
+                {entry.rawSpecialChars ? '  (special characters unescaped)' : ''}
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+
+      {api && api.jwts.length > 0 && (
+        <>
+          <div className="subhead">Tokens found in page source</div>
+          <div className="evidence">
+            {api.jwts.map((jwt, index) => (
+              <div
+                key={`${jwt.masked}-${index}`}
+                style={{
+                  color: jwt.privileged
+                    ? SEVERITY_COLOR.critical
+                    : jwt.publicByDesign || jwt.expired
+                      ? undefined
+                      : SEVERITY_COLOR.medium,
+                }}
+              >
+                line ~{jwt.line} · {jwt.masked}
+                {jwt.role ? ` · role ${jwt.role}` : ''}
+                {jwt.expiresAt ? ` · exp ${jwt.expiresAt.slice(0, 10)}` : ' · no expiry'}
+                {jwt.expired ? '  (expired)' : ''}
+                {jwt.publicByDesign ? '  (public by design)' : ''}
+              </div>
+            ))}
+          </div>
+          <p style={{ fontSize: 12, color: 'var(--text-ghost)', margin: '8px 0 0' }}>
+            Claims are read without verifying the signature; tokens are masked by the scanner.
+          </p>
+        </>
+      )}
+
+      {api && api.credentialBearingUrls.length > 0 && (
+        <>
+          <div className="subhead">Credentials carried in URLs</div>
+          <div className="evidence">
+            {api.credentialBearingUrls.map((url) => (
+              <div key={url} style={{ color: SEVERITY_COLOR.high }}>
+                {url}
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+
+      {api && (api.internalEndpoints.length > 0 || api.metadataEndpoints.length > 0) && (
+        <>
+          <div className="subhead">Internal endpoints referenced</div>
+          <div className="evidence">
+            {[...api.metadataEndpoints, ...api.internalEndpoints].map((endpoint) => (
+              <div key={endpoint} style={{ color: SEVERITY_COLOR.medium }}>
+                {endpoint}
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+
+      {api && api.endpoints.length > 0 && (
+        <>
+          <div className="subhead">API endpoints ({api.endpoints.length})</div>
+          <div className="evidence">
+            {api.endpoints.map((endpoint) => (
+              <div key={endpoint.url}>
+                {endpoint.kind} · {endpoint.url}
+                {endpoint.thirdParty ? '  (third party)' : ''}
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+
       <div className="subhead">Summary</div>
       <dl className="facts">
         <Fact label="External scripts" value={data.scriptCount} />
@@ -414,6 +540,58 @@ function ContentDetails({ data }: { data: ContentData }) {
         />
         <Fact label="Third-party origins" value={data.thirdPartyOrigins.length} />
         <Fact label="Forms" value={`${data.formCount} (${data.insecureFormCount} insecure)`} />
+        {injection && (
+          <>
+            <Fact
+              label="Inline scripts"
+              value={`${injection.inlineScriptCount} (${(injection.inlineScriptBytes / 1024).toFixed(1)} KB)`}
+            />
+            <Fact
+              label="DOM sinks fed from URL"
+              value={
+                taintedSinks > 0 ? (
+                  <span style={{ color: SEVERITY_COLOR.high }}>{taintedSinks}</span>
+                ) : (
+                  0
+                )
+              }
+            />
+            <Fact
+              label="postMessage listeners"
+              value={`${injection.postMessageListeners} (${injection.postMessageOriginChecks} check origin)`}
+            />
+            <Fact
+              label="POST forms without token"
+              value={`${injection.postFormsWithoutToken} of ${injection.postFormCount}`}
+            />
+            <Fact label="Inline event handlers" value={injection.inlineEventHandlers} />
+          </>
+        )}
+        {api && (
+          <>
+            <Fact
+              label="CORS allow-origin"
+              value={
+                api.cors.allowOrigin === '*' ? (
+                  <span style={{ color: SEVERITY_COLOR.low }}>*</span>
+                ) : (
+                  (api.cors.allowOrigin ?? 'not set')
+                )
+              }
+            />
+            <Fact label="CORS credentials" value={api.cors.allowCredentials ? 'allowed' : 'no'} />
+            <Fact
+              label="Hard-coded auth headers"
+              value={
+                api.hardcodedAuthHeaders > 0 ? (
+                  <span style={{ color: SEVERITY_COLOR.high }}>{api.hardcodedAuthHeaders}</span>
+                ) : (
+                  0
+                )
+              }
+            />
+          </>
+        )}
         <Fact label="HTML analysed" value={`${(data.bytesAnalysed / 1024).toFixed(1)} KB`} />
         <Fact label="Truncated" value={data.truncated ? 'yes' : 'no'} />
       </dl>

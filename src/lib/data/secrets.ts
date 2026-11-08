@@ -138,14 +138,14 @@ export const SECRET_PATTERNS: SecretPattern[] = [
     recommendation:
       'This is the key that is meant to be public. No action needed — noted only to confirm no secret key sits beside it.',
   },
-  {
-    id: 'jwt',
-    name: 'JSON Web Token',
-    pattern: /\b(eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})\b/g,
-    severity: 'medium',
-    recommendation:
-      'Check what this token grants and whether it has expired. Some are public anon keys (Supabase) and belong here; a session or service token does not.',
-  },
+  /*
+   * JWTs are deliberately absent from this list. Shape alone cannot tell a
+   * Supabase anon key (published on purpose) from a service_role key (total
+   * compromise of the data behind the API), and reporting both as "a JWT,
+   * severity medium" is no use to either reader. `checks/api.ts` decodes the
+   * claims and grades on what the token says it grants; `redact.ts` keeps its
+   * own JWT pattern, so a raw token still never reaches the output.
+   */
   {
     id: 'firebase.config',
     name: 'Firebase configuration block',

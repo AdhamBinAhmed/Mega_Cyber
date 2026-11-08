@@ -8,6 +8,7 @@
  */
 
 import type { Severity } from '../types';
+import { API_PATHS } from './api-paths';
 
 export interface ExposurePath {
   path: string;
@@ -27,7 +28,7 @@ export interface ExposurePath {
   recommendation?: string;
 }
 
-export const EXPOSURE_PATHS: ExposurePath[] = [
+const FILE_PATHS: ExposurePath[] = [
   {
     path: '/robots.txt',
     description: 'Crawler directives',
@@ -118,6 +119,14 @@ export const EXPOSURE_PATHS: ExposurePath[] = [
     recommendation: 'Restrict mod_status to localhost, or disable it.',
   },
 ];
+
+/**
+ * Everything the sweep requests: the file-level paths above plus the API
+ * documentation and diagnostic endpoints. Kept as one list because the probe
+ * machinery, the soft-404 baseline and the request budget apply identically to
+ * both — the split is editorial, so each group can be reviewed on its own.
+ */
+export const EXPOSURE_PATHS: ExposurePath[] = [...FILE_PATHS, ...API_PATHS];
 
 /** Paths in robots.txt that advertise something worth a closer look. */
 export const SENSITIVE_ROBOTS_PATTERNS =

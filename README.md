@@ -65,10 +65,49 @@ All of the motion is disabled under `prefers-reduced-motion`.
 |---|---|---|
 | **HTTP security headers** | 24% | CSP, HSTS, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy — plus cookie flags, version-disclosing headers, and whether HTTP redirects to HTTPS |
 | **SSL / TLS** | 22% | Certificate validity, expiry, hostname coverage, chain trust, key strength; which TLS versions are accepted (1.0/1.1 flagged as weak); the Qualys SSL Labs grade |
-| **Exposed files** | 20% | A GET of 12 well-known paths (`/.env`, `/.git/config`, `/wp-config.php.bak`, `/robots.txt`, …) reporting only whether each is readable |
+| **Exposed files** | 20% | A GET of 21 well-known paths — files (`/.env`, `/.git/config`, `/wp-config.php.bak`, `/robots.txt`, …) and API endpoints (`/openapi.json`, `/api-docs`, `/graphql`, `/actuator/env`, `/metrics`, …) — reporting only whether each is readable |
 | **DNS & email authentication** | 9% | SPF, DKIM, DMARC and CAA records via Node's built-in `dns` |
 | **Technology & known CVEs** | 10% | CMS/framework/library fingerprint from meta tags, headers, cookies and script URLs, correlated against a static advisory table |
-| **Page content & supply chain** | 15% | Credentials leaked in page source, Subresource Integrity gaps, mixed content, third-party script inventory, source maps, insecure forms, internal detail in comments |
+| **Page content & supply chain** | 15% | Credentials leaked in page source, Subresource Integrity gaps, mixed content, third-party script inventory, source maps, insecure forms, internal detail in comments — plus the client-side injection surface below |
+
+### Client-side injection (XSS, CSRF and friends)
+
+Part of the page-content section, read from the same HTML and costing no extra
+request:
+
+| Check | What it looks for |
+|---|---|
+| **DOM XSS** | A URL-derived source (`location.hash`, `location.search`, `document.referrer`, `window.name`, `postMessage` data) reaching an HTML or code sink (`.innerHTML`, `.outerHTML`, `insertAdjacentHTML`, `document.write`, jQuery `.html()`, `.srcdoc`, `eval`, `new Function`, string timers) |
+| **DOM open redirect** | The same sources reaching a `location` assignment |
+| **Reflected parameters** | Whether values from the submitted URL come back in the response, and in which context (HTML, attribute, script) |
+| **postMessage** | Message listeners with no visible `event.origin` check |
+| **`javascript:` URIs** | Executable URIs in `href`/`src`/`action`, ignoring `void(0)` placeholders |
+| **Inline event handlers** | Counted as the blocker they are for adopting a nonce-based CSP (no score penalty — the cost already shows up in the CSP grade) |
+| **`document.domain`** | Assignments that opt the page out of strict origin isolation |
+| **CSRF tokens** | POST forms carrying no hidden token field |
+
+Severity here encodes confidence as well as impact, and a nonce- or hash-based
+CSP demotes the DOM findings one level, because it removes most of the ways to
+reach them. See "Avoiding false positives" below.
+
+### API surface leakage
+
+Also part of the page-content section, from the same document and response
+headers:
+
+| Check | What it looks for |
+|---|---|
+| **Decoded JWT claims** | Tokens in page source are base64-decoded and graded on what they claim: a `service_role`/admin role is `critical`, a no-expiry bearer token `medium`, an unexpired one `low`, an expired one `info`, and an `anon` key is reported as public by design. Signatures are never verified; tokens are always masked |
+| **Credentials in URLs** | `api_key`, `access_token`, `signature`, … carried in a query string, where they leak onward through Referer, logs, caches and history |
+| **Hard-coded Authorization** | A fixed `Bearer`/`Basic` value compiled into client-side code |
+| **Internal endpoints** | `localhost`, private addresses, `.internal`/`.corp`/`.local` suffixes and `staging`/`uat`/`qa` hosts referenced from public source |
+| **Cloud metadata** | References to `169.254.169.254` and friends |
+| **CORS policy** | `Access-Control-Allow-Origin: *` with credentials, `Origin: null` allowed, or a single named origin with credentials (which cannot be told from a reflected one without sending an `Origin` header) |
+| **Endpoint inventory** | Distinct REST/GraphQL/storage endpoints visible in the HTML, marked where they belong to a third party |
+
+The CORS headers observed are the HTML response's, not the API's, and the
+findings say so: a wildcard on a public page is normal, and the same wildcard on
+a credentialed endpoint is a breach.
 
 ## What it deliberately does not do
 
@@ -188,7 +227,7 @@ curl -X POST https://scanner.megadevs.example/api/scan \
 
 ```jsonc
 {
-  "schemaVersion": "1.1",
+  "schemaVersion": "1.2",
   "scanId": "…",
   "target": { "input": "example.com", "url": "https://example.com/", "finalUrl": "…", "resolvedIps": ["…"] },
   "overall": {
@@ -221,7 +260,7 @@ curl -X POST https://scanner.megadevs.example/api/scan \
       ],
       "data": { /* raw observations: every header, the redirect chain, cookies … */ }
     }
-    // tls, dns, exposure, fingerprint
+    // tls, dns, exposure, fingerprint, content
   },
   "meta": { "passive": true, "notes": ["…"] }
 }
@@ -312,6 +351,22 @@ than no answer:
   registrable domain (`static.example.com`) is reported separately from a
   genuinely external one. Calling a site's own CDN "a separate company that can
   change your site" overstates the risk and makes the finding easy to dismiss.
+- **JWTs are decoded, not pattern-matched.** A Supabase `anon` key and a
+  `service_role` key are the same shape and nearly opposite in consequence, so
+  the generic "a JWT, severity medium" pattern was removed from
+  `data/secrets.ts` in favour of reading the claims. The redaction backstop
+  keeps its own JWT pattern, so a raw token still never reaches the output.
+- **Credentials in URLs** are filtered against a placeholder list
+  (`YOUR_API_KEY`, `${apiKey}`, `%TOKEN%`) and a minimum length, because
+  template placeholders in page source are common and harmless.
+- **DOM XSS leads.** A regex cannot prove that `location.hash` reaches
+  `innerHTML`, and cannot prove the opposite either, so the finding says which
+  it is. Source and sink in the same expression is graded as a real finding and
+  worded as a lead to confirm by hand; the same script but not the same
+  expression is a `low` pointer; a sink with no source anywhere is `info`
+  inventory scored at zero. Reflected parameters are the exception: when a value
+  comes back with its quotes and angle brackets intact, missing output encoding
+  is observed rather than inferred, and graded accordingly.
 - **CVE matching.** Matches come from a version string in a public page, which is
   strong evidence but not proof. The published severity is preserved in
   `vulnerabilities[].severity`, but the corresponding *finding* is reported one
@@ -415,11 +470,16 @@ src/
     ip.ts  lookup.ts         SSRF classification and the pinned DNS lookup
     http.ts                  the HTTP client
     errors.ts                turning thrown values into readable reasons
-    checks/                  headers, tls, dns, exposure, fingerprint
-    data/                    cves.ts, exposure-paths.ts  ← extend these first
+    checks/                  headers, tls, dns, exposure, fingerprint, content, injection, api
+    data/                    cves.ts, exposure-paths.ts, api-paths.ts, secrets.ts  ← extend these first
 ```
 
-To add a check: write `src/lib/checks/<name>.ts` returning a `SectionReport` via
+A check does not have to be its own section: `checks/injection.ts` returns
+findings plus a data payload and is folded into the content section, which is
+the right shape whenever a check reads a document another check already
+fetched.
+
+To add a section: write `src/lib/checks/<name>.ts` returning a `SectionReport` via
 `buildSection`, add its id to `SectionId`, give it a weight in `SECTION_WEIGHTS`,
 and call it from `runScan`. The dashboard picks up anything in `sections`;
 `SectionDetails` renders the structured `data` payload per section.
@@ -471,6 +531,12 @@ Worth being upfront about with clients:
 - **No JavaScript execution.** Technologies loaded only at runtime are invisible,
   and SPA-heavy sites expose less to fingerprinting. Only the first 512 KB of
   HTML is analysed.
+- **Injection findings cover inline script only, and are leads rather than
+  proof.** Logic in bundled `.js` files is not fetched or parsed, so a DOM XSS
+  living there is invisible; conversely nothing here is confirmed, because
+  confirming it would mean sending a payload, which this scanner does not do.
+  Reflected-parameter checks only report what the submitted URL already
+  contained — the scanner never appends a parameter of its own.
 - **DKIM absence is inconclusive.** Selectors are chosen by the sender and cannot
   be enumerated from DNS; the scanner probes 19 common ones and labels a miss as
   inconclusive rather than failing.
@@ -480,6 +546,11 @@ Worth being upfront about with clients:
 - **The registrable-domain helper is a heuristic**, not the full Public Suffix
   List. It covers the common multi-label suffixes (`co.uk`, `com.au`, …).
 - **One page, one host.** No crawling, no subdomain enumeration.
+- **API checks see only what the page shows.** CORS is read from the HTML
+  response rather than from each endpoint, no API is called with a crafted
+  request, and GraphQL presence is established from a plain GET — no
+  introspection query is ever sent. The endpoint inventory is what is visible in
+  source, not a discovered API map.
 - **A passive scan is a starting point, not a penetration test**, and the
   dashboard says so.
 

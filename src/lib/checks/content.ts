@@ -10,6 +10,11 @@
  * more trust than ten missed findings, so candidates must clear an entropy
  * bar, dodge a placeholder blocklist, and keys that are public by design are
  * classified as such rather than reported as leaks.
+ *
+ * The client-side injection surface (DOM XSS, reflected parameters,
+ * postMessage, CSRF tokens) and the API surface it leaks (CORS, endpoint
+ * inventory, tokens, internal hosts) are analysed from the same document by
+ * ./injection and ./api, and folded in here, so they cost no extra request.
  */
 
 import type { ContentData, Finding, SectionReport, Severity } from '../types';
@@ -17,6 +22,8 @@ import { buildSection, sortFindings } from '../scoring';
 import type { RawResponse } from '../http';
 import { entropy, looksLikeRealSecret, maskValue, redact } from '../redact';
 import { EXAMPLE_MARKERS, SECRET_PATTERNS } from '../data/secrets';
+import { analyseInjection } from './injection';
+import { analyseApiSurface } from './api';
 import { registrableDomain } from '../target';
 
 /** Attribute value extractor that tolerates single, double or no quotes. */
@@ -515,6 +522,22 @@ export function runContentCheck(
     });
   }
 
+  /* -------------------- client-side injection surface -------------------- */
+  // Same document, no extra request. A nonce-based CSP softens the DOM
+  // findings, so the policy is passed in rather than looked up again.
+  const injection = analyseInjection(
+    html,
+    base,
+    response.headers['content-security-policy'] ??
+      response.headers['content-security-policy-report-only'] ??
+      null,
+  );
+  findings.push(...injection.findings);
+
+  /* ---------------------------- API surface ------------------------------ */
+  const apiSurface = analyseApiSurface(html, base, response.headers);
+  findings.push(...apiSurface.findings);
+
   /* ------------------------------- assemble ------------------------------ */
   const data: ContentData = {
     bytesAnalysed: response.bodyBytes,
@@ -533,16 +556,37 @@ export function runContentCheck(
     sourceMaps,
     formCount: forms.length,
     insecureFormCount: insecureForms.length,
+    injection: injection.data,
+    apiSurface: apiSurface.data,
   };
 
+  const taintedSinks = injection.data.domSinks.filter(
+    (sink) => sink.proximity === 'expression',
+  ).length;
+  const unencodedReflections = injection.data.reflectedParams.filter(
+    (entry) => entry.rawSpecialChars,
+  ).length;
+
+  const apiLeaks = findings.filter(
+    (finding) =>
+      finding.id.startsWith('api.') &&
+      (finding.severity === 'critical' || finding.severity === 'high'),
+  ).length;
+
   const summary =
-    leaks.length > 0
+    apiLeaks > 0 && leaks.length === 0
+      ? `${apiLeaks} API credential or endpoint leak${apiLeaks === 1 ? '' : 's'} in page source.`
+      : leaks.length > 0
       ? `${leaks.length} credential${leaks.length === 1 ? '' : 's'} exposed in page source.`
       : unpinned.length > 0
         ? `${unpinned.length} third-party script${unpinned.length === 1 ? '' : 's'} loaded without integrity checking.`
         : insecureRefs.length > 0
           ? `${insecureRefs.length} subresource${insecureRefs.length === 1 ? '' : 's'} loaded over plain HTTP.`
-          : 'No credential leaks, mixed content or unpinned third-party script.';
+          : unencodedReflections > 0
+            ? `${unencodedReflections} URL parameter${unencodedReflections === 1 ? '' : 's'} reflected into the page unencoded.`
+            : taintedSinks > 0
+              ? `${taintedSinks} possible DOM XSS sink${taintedSinks === 1 ? '' : 's'} fed from the URL.`
+              : 'No credential leaks, mixed content, unpinned third-party script or DOM injection leads.';
 
   const section = buildSection(
     'content',

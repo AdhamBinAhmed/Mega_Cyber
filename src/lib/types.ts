@@ -7,10 +7,15 @@
 
 /**
  * 1.1 added the `content` section, `meta.requests`, cross-origin header and
- * cookie-scope observations. All additive: a 1.0 consumer still works, and the
- * dashboard renders a 1.0 report by simply omitting the sections it lacks.
+ * cookie-scope observations. 1.2 added `content.data.injection`, the
+ * client-side injection surface (DOM XSS sinks, reflected parameters,
+ * postMessage listeners, CSRF tokens). 1.3 added `content.data.apiSurface`
+ * (CORS policy, API endpoint inventory, decoded JWT claims, credentials in
+ * URLs) and the API documentation paths in the exposure sweep. All additive: a
+ * 1.0 consumer still works, and the dashboard renders an older report by
+ * simply omitting the parts it lacks.
  */
-export const SCHEMA_VERSION = '1.1' as const;
+export const SCHEMA_VERSION = '1.3' as const;
 
 export type Grade = 'A+' | 'A' | 'B' | 'C' | 'D' | 'F';
 
@@ -230,6 +235,100 @@ export interface ContentData {
   sourceMaps: string[];
   formCount: number;
   insecureFormCount: number;
+  /**
+   * Client-side injection surface. Absent on reports produced before schema
+   * 1.2, so consumers should treat it as optional at runtime.
+   */
+  injection: InjectionData;
+  /** API surface leakage. Absent before schema 1.3. */
+  apiSurface: ApiSurfaceData;
+}
+
+/** A JWT found in page source, described by its own (unverified) claims. */
+export interface JwtObservation {
+  /** Masked by the scanner; the raw token is never serialised. */
+  masked: string;
+  alg: string | null;
+  /** role / roles / scope / permissions claim, whichever was present. */
+  role: string | null;
+  issuer: string | null;
+  subject: string | null;
+  expiresAt: string | null;
+  /** Null when the token carries no exp claim. */
+  expired: boolean | null;
+  /** No expiry, or a lifetime longer than a year. */
+  longLived: boolean;
+  /** Claims a role that bypasses per-user authorisation (service_role, admin). */
+  privileged: boolean;
+  /** An anon/public key that platforms expect you to publish. */
+  publicByDesign: boolean;
+  line: number;
+}
+
+export interface ApiEndpointObservation {
+  /** Origin plus path; query strings are dropped. */
+  url: string;
+  kind: 'rest' | 'graphql' | 'storage' | 'other';
+  crossOrigin: boolean;
+  /** Different registrable domain, so genuinely someone else's API. */
+  thirdParty: boolean;
+}
+
+export interface ApiSurfaceData {
+  /** CORS headers on the HTML response — not necessarily the API's own. */
+  cors: {
+    allowOrigin: string | null;
+    allowCredentials: boolean;
+    allowMethods: string | null;
+    allowHeaders: string | null;
+    exposeHeaders: string | null;
+  };
+  endpoints: ApiEndpointObservation[];
+  /** localhost, private addresses, internal suffixes, staging hosts. */
+  internalEndpoints: string[];
+  /** Cloud instance metadata services referenced from the page. */
+  metadataEndpoints: string[];
+  /** Credential-bearing URLs, with the credential masked. */
+  credentialBearingUrls: string[];
+  hardcodedAuthHeaders: number;
+  jwts: JwtObservation[];
+}
+
+export interface DomSinkObservation {
+  /** Sink label, e.g. ".innerHTML assignment". */
+  sink: string;
+  /** URL-derived source found near the sink, when there was one. */
+  source: string | null;
+  /** "expression": the source sits beside the sink. "script": same script only. */
+  proximity: 'expression' | 'script' | 'none';
+  line: number;
+  snippet: string;
+}
+
+export interface ReflectedParamObservation {
+  param: string;
+  /** Where in the document the value came back. */
+  context: 'script' | 'attribute' | 'html';
+  /** True when the value was reflected with its special characters intact. */
+  rawSpecialChars: boolean;
+}
+
+/** Client-side injection surface, all of it read from the served HTML. */
+export interface InjectionData {
+  inlineScriptCount: number;
+  inlineScriptBytes: number;
+  inlineEventHandlers: number;
+  domSinks: DomSinkObservation[];
+  postMessageListeners: number;
+  /** Listeners that compare event.origin against something. */
+  postMessageOriginChecks: number;
+  javascriptUris: string[];
+  reflectedParams: ReflectedParamObservation[];
+  postFormCount: number;
+  postFormsWithoutToken: number;
+  documentDomainWrites: number;
+  /** A nonce/hash CSP was in force, so the DOM findings were demoted. */
+  cspMitigates: boolean;
 }
 
 export type TechCategory =
